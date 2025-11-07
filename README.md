@@ -1,4 +1,7 @@
 # RNS_Over_Meshtastic
+
+IGNORE THIS FOR NOW - IT'S ACTIVELY IN WORK AND NON-FUNCTIONAL
+
 Interface for RNS using Meshtastic as the underlying networking layer to utilize existing meshtastic hardware.
 
 - This is a direct followup project to https://github.com/landandair/Meshtastic_File_Transfer and fixes many of its issues (use the rncp utility of RNS and get a more reliable easy to use utility)
