@@ -4,6 +4,7 @@
 # mode = boundary
 # port = /dev/ttyUSB0
 # speed = 115200
+# endpoint_contact = None
 
 import asyncio
 import threading
@@ -13,6 +14,9 @@ import re
 
 # Minimal MeshCore interface
 class MeshCoreInterface(Interface):
+
+    print("[MeshCore] Module imported successfully")
+
     DEFAULT_IFAC_SIZE = 8
 
     HW_MTU = 184
@@ -34,6 +38,8 @@ class MeshCoreInterface(Interface):
         
         self._meshcore_module = meshcore
         self._meshcore_EventType = EventType
+        
+        RNS.log("MeshCore_Interface: loaded successfully from Reticulum", RNS.LOG_INFO)
         
         # We start out by initialising the super-class
         super().__init__()
@@ -91,8 +97,10 @@ class MeshCoreInterface(Interface):
         self._loop_thread = threading.Thread(target=_loop_thread_target, args=(self._loop,), daemon=True)
         self._loop_thread.start()
         time.sleep(0.05)
+        RNS.log(f"MeshCore: started event loop thread {self._loop_thread.name}", RNS.LOG_INFO)
     
     def _loop_alive(self):
+        RNS.log(f"MeshCore: loop alive check: {self._loop_thread.is_alive() if self._loop_thread else 'no thread'}", RNS.LOG_DEBUG)
         return self._loop_thread and self._loop_thread.is_alive()
     
     def _run_coro(self, coro, timeout=None):
@@ -121,7 +129,11 @@ class MeshCoreInterface(Interface):
         try:
             create_coro = meshcore.MeshCore.create_serial(self.port, 115200, debug=True)
             self.mesh = self._run_coro(create_coro, timeout=15)
+            if not self.mesh:
+                raise RuntimeError("MeshCore: failed to initialize mesh object")
             RNS.log(f"MeshCore: connected to device on {self.port}", RNS.LOG_INFO)
+            time.sleep(1.0)
+#            self._run_coro(self.mesh.commands.ping(), timeout=5)
         except Exception as e:
             RNS.log(f"MeshCore: create_serial failed for {self.port}: {e}", RNS.LOG_ERROR)
             raise
@@ -140,6 +152,7 @@ class MeshCoreInterface(Interface):
                 try:
                     if hasattr(self.mesh, "start_auto_message_fetching"):
                         await self.mesh.start_auto_message_fetching()
+                        RNS.log("Meshcore: auto message fetching started", RNS.LOG_INFO)
                 except Exception as e:
                     RNS.log(f"MeshCore: start_auto_message_fetching() failed: {e}", RNS.LOG_WARNING)
                 
@@ -207,10 +220,14 @@ class MeshCoreInterface(Interface):
                     try:
                         self.mesh.subscribe(EventType.CONTACT_MSG_RECV, _on_contact_msg)
                         self.mesh.subscribe(EventType.NEW_CONTACT, _on_new_contact)
+                        if not self.mesh._event_callbacks.get(EventType.CONTACT_MSG_RECV):
+                            RNS.log("MeshCore: no CONTACT_MSG_RECV subscription active!", RNS.LOG_WARNING)
                     except Exception:
                         try:
                             await self.mesh.subscribe(EventType.CONTACT_MSG_RECV, _on_contact_msg)
                             await self.mesh.subscribe(EventType.NEW_CONTACT, _on_new_contact)
+                            if not self.mesh._event_callbacks.get(EventType.CONTACT_MSG_RECV):
+                                RNS.log("MeshCore: no CONTACT_MSG_RECV subscription active!", RNS.LOG_WARNING)
                         except Exception as e:
                             RNS.log(f"Meshcore: subscription to events failed: {e}", RNS.LOG_WARNING)
             
@@ -346,7 +363,7 @@ class MeshCoreInterface(Interface):
         self.outgoing_packet_storage[handler.index] = handler
         self.packet_index = (self.packet_index + 1) % 256
         
-    def should_ingress_limit(self):
+    def should_ingress_limit(self, dest=None):
         return False
     
     def __str__(self):
@@ -394,4 +411,3 @@ class PacketHandler:
             return None
 
 interface_class = MeshCoreInterface
-
