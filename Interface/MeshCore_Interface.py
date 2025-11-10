@@ -11,6 +11,7 @@ import threading
 import time
 import struct
 import re
+import base64
 
 # Minimal MeshCore interface
 class MeshCoreInterface(Interface):
@@ -165,33 +166,39 @@ class MeshCoreInterface(Interface):
         return 
     
     def _payload_for_send(self, data: bytes) -> str:
-        """Convert bytes to a meshcore-safe string for sending (latin-1 round-trip)."""
-        return data.decode("latin-1")
-    
-    def _payload_from_received(self, payload_obj):
-        """Normalize payloads delivered by meshcore event into raw bytes.
-        Accepts dicts with 'payload'/'data'/'text', bytes, and other shapes.
-        Returns bytes or None.
-        """
+        """Encode binary data as Base64 string for MeshCore transmission."""
         try:
-            if isinstance(payload_obj, (bytes, bytearray)):
-                return bytes(payload_obj)
+            return base64.b64encode(data).decode("ascii")
+        except Exception as e:
+            RNS.log(f"MeshCore: base64 encode failed: {e}", RNS.LOG_ERROR)
+            return ""
+
+    def _payload_from_received(self, payload_obj):
+        """Decode Base64 MeshCore payloads back into raw bytes."""
+        try:
+            encoded = None
             if isinstance(payload_obj, dict):
                 # prefer payload, then data, then text
-                if 'payload' in payload_obj and isinstance(payload_obj['payload'], (bytes, bytearray)):
-                    return bytes(payload_obj['payload'])
-                if 'data' in payload_obj and isinstance(payload_obj['data'], (bytes, bytearray)):
-                    return bytes(payload_obj['data'])
-                if 'text' in payload_obj and isinstance(payload_obj['text'], str):
-                    try:
-                        return payload_obj['text'].encode('latin-1')
-                    except Exception:
-                        return payload_obj['text'].encode('utf-8', errors='ignore')
-            if isinstance(payload_obj, str):
-                # strings are latin-1 encoded sends from our side
-                return payload_obj.encode('latin-1')
-        except Exception:
-            pass
+                for key in ("payload", "data", "text"):
+                    val = payload_obj.get(key)
+                    if isinstance(val, (bytes, bytearray)):
+                        return bytes(val)
+                    if isinstance(val, str):
+                        encoded = val
+                        break
+            elif isinstance(payload_obj, str):
+                encoded = payload_obj
+
+            if encoded is not None:
+                try:
+                    return base64.b64decode(encoded, validate=True)
+                except Exception:
+                    # fallback if it wasn't base64
+                    return encoded.encode("latin-1")
+
+        except Exception as e:
+            RNS.log(f"MeshCore: base64 decode failed: {e}", RNS.LOG_ERROR)
+
         return None
     
     def _open_serial_and_init(self):
