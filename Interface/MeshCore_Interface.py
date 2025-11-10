@@ -293,6 +293,8 @@ class MeshCoreInterface(Interface):
 
                         # If we have data bytes, extract RNS dest slice and store mapping
                         if data_bytes:
+                            RNS.log(f"MeshCore: inbound {len(data_bytes)} bytes (hex start: {data_bytes[:16].hex()})", RNS.LOG_DEBUG)
+                            self.owner.inbound(data_bytes, self)
                             try:
                                 if len(data_bytes) >= 18:
                                     rns_dest_bytes = data_bytes[2:18]
@@ -331,6 +333,8 @@ class MeshCoreInterface(Interface):
 
                         # Deliver bytes to Reticulum owner inbound
                         if data_bytes:
+                            RNS.log(f"MeshCore: inbound {len(data_bytes)} bytes (hex start: {data_bytes[:16].hex()})", RNS.LOG_DEBUG)
+                            self.owner.inbound(data_bytes, self)
                             try:
                                 if hasattr(self.owner, "inbound"):
                                     self.owner.inbound(data_bytes, self)
