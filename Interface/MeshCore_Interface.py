@@ -1,7 +1,7 @@
 # [[MeshCore Interface]]
 # type = MeshCore_Interface
 # enabled = true
-# mode = boundary
+# mode = gateway
 # port = /dev/ttyUSB0
 # speed = 115200
 # endpoint_contact = None
@@ -119,6 +119,81 @@ class MeshCoreInterface(Interface):
             raise RuntimeError("Event loop not started")
         return asyncio.run_coroutine_threadsafe(coro, self._loop)
     
+    def _resolve_destination(self, candidate):
+        """Return a contact dict, public-key hex string, or bytes, or None."""
+        if candidate is None:
+            return None
+
+        # bytes/bytearray -> bytes
+        if isinstance(candidate, (bytes, bytearray)):
+            try:
+                return bytes(candidate).hex()
+            except Exception:
+                return None
+
+        # contact dict (from get_contacts) -> pass through
+        if isinstance(candidate, dict):
+            return candidate
+
+        # string: test for hex public key
+        if isinstance(candidate, str):
+            s = candidate.strip()
+            # quick hex test: hex chars and even length
+            if s and all(c in "0123456789abcdefABCDEF" for c in s) and len(s) % 2 == 0:
+                return s
+
+            # try to resolve advert name or key prefix using mesh contacts
+            try:
+                if hasattr(self.mesh, "commands") and hasattr(self.mesh.commands, "get_contacts"):
+                    res = self._run_coro(self.mesh.commands.get_contacts(), timeout=5)
+                else:
+                    res = None
+                if res and getattr(res, "type", None) != self._meshcore_EventType.ERROR:
+                    contacts = getattr(res, "payload", {}) or {}
+                    # exact advert name match (case-insensitive)
+                    for key, contact in contacts.items():
+                        adv = contact.get("adv_name")
+                        if adv and adv.lower() == s.lower():
+                            return contact
+                    # key prefix match
+                    for key, contact in contacts.items():
+                        if isinstance(key, str) and key.startswith(s):
+                            return contact
+            except Exception:
+                pass
+
+        return 
+    
+    def _payload_for_send(self, data: bytes) -> str:
+        """Convert bytes to a meshcore-safe string for sending (latin-1 round-trip)."""
+        return data.decode("latin-1")
+    
+    def _payload_from_received(self, payload_obj):
+        """Normalize payloads delivered by meshcore event into raw bytes.
+        Accepts dicts with 'payload'/'data'/'text', bytes, and other shapes.
+        Returns bytes or None.
+        """
+        try:
+            if isinstance(payload_obj, (bytes, bytearray)):
+                return bytes(payload_obj)
+            if isinstance(payload_obj, dict):
+                # prefer payload, then data, then text
+                if 'payload' in payload_obj and isinstance(payload_obj['payload'], (bytes, bytearray)):
+                    return bytes(payload_obj['payload'])
+                if 'data' in payload_obj and isinstance(payload_obj['data'], (bytes, bytearray)):
+                    return bytes(payload_obj['data'])
+                if 'text' in payload_obj and isinstance(payload_obj['text'], str):
+                    try:
+                        return payload_obj['text'].encode('latin-1')
+                    except Exception:
+                        return payload_obj['text'].encode('utf-8', errors='ignore')
+            if isinstance(payload_obj, str):
+                # strings are latin-1 encoded sends from our side
+                return payload_obj.encode('latin-1')
+        except Exception:
+            pass
+        return None
+    
     def _open_serial_and_init(self):
         
         meshcore = self._meshcore_module
@@ -133,7 +208,7 @@ class MeshCoreInterface(Interface):
                 raise RuntimeError("MeshCore: failed to initialize mesh object")
             RNS.log(f"MeshCore: connected to device on {self.port}", RNS.LOG_INFO)
             time.sleep(1.0)
-#            self._run_coro(self.mesh.commands.ping(), timeout=5)
+ #           self._run_coro(self.mesh.commands.ping(), timeout=5) << NEED TO SEE IF I CAN USE is_connected FOR THIS
         except Exception as e:
             RNS.log(f"MeshCore: create_serial failed for {self.port}: {e}", RNS.LOG_ERROR)
             raise
@@ -158,78 +233,111 @@ class MeshCoreInterface(Interface):
                 
                 try:
                     async def _on_contact_msg(event):
-                        payload = event.payload
+                        payload = getattr(event, "payload", None)
                         from_key = None
                         data_bytes = None
-                    
-                        if isinstance(payload, dict):
-                            if 'payload' in payload and isinstance(payload['payload'], (bytes, bytearray)):
-                                data_bytes = bytes(payload['payload'])
-                            elif 'text' in payload and isinstance(payload['text'], str):
-                                data_bytes = payload['text'].encode('utf-8')
-                            elif 'data' in payload and isinstance(payload['data'], (bytes, bytearray)):
-                                data_bytes = bytes(payload['data'])
-                                
-                            if 'public_key' in payload:
-                                from_key = payload['public_key']
-                            elif 'pubkey_prefix' in payload:
-                                from_key = payload['pubkey_prefix']
-                    
+                        contact_obj = None
+
+                        # Extract payload and contact/public key info (many meshcore builds use varying shapes)
+                        try:
+                            if isinstance(payload, dict):
+                                # contact dict may be provided directly
+                                contact_obj = payload.get("contact") if isinstance(payload.get("contact"), dict) else None
+
+                                # public key fields
+                                if isinstance(payload.get("public_key"), str):
+                                    from_key = payload.get("public_key")
+                                elif isinstance(payload.get("pubkey_prefix"), str):
+                                    from_key = payload.get("pubkey_prefix")
+
+                                # try to normalize the payload to bytes using class helper
+                                data_bytes = self._payload_from_received(payload)
+                            elif isinstance(payload, (bytes, bytearray, str)):
+                                data_bytes = self._payload_from_received(payload)
+                        except Exception:
+                            data_bytes = None
+
+                        # If contact object present but no from_key, try to read public_key from it
+                        try:
+                            if not from_key and isinstance(contact_obj, dict):
+                                pk = contact_obj.get("public_key") or contact_obj.get("pubkey_prefix")
+                                if isinstance(pk, str):
+                                    from_key = pk
+                        except Exception:
+                            pass
+
+                        # If we have data bytes, extract RNS dest slice and store mapping
                         if data_bytes:
                             try:
                                 if len(data_bytes) >= 18:
-                                    bit_str = "{:08b}".format(data_bytes[0])
-                                    if re.match(r'00..11..', bit_str):
-                                        dest = data_bytes[2:18]
+                                    rns_dest_bytes = data_bytes[2:18]
+                                    try:
+                                        dest_hex = bytes(rns_dest_bytes).hex()
+                                    except Exception:
+                                        dest_hex = None
+
+                                    # Prefer storing the full contact dict for later send_msg calls if available
+                                    stored_value = None
+                                    if contact_obj:
+                                        stored_value = contact_obj
+                                    else:
+                                        if isinstance(from_key, (bytes, bytearray)):
+                                            try:
+                                                stored_value = bytes(from_key).hex()
+                                            except Exception:
+                                                stored_value = None
+                                        elif isinstance(from_key, str):
+                                            stored_value = from_key.strip()
+
+                                    if dest_hex and stored_value:
                                         try:
-                                            if len(self.dest_to_node_dict) > 20:
+                                            # bound size to avoid unbounded memory growth
+                                            if len(self.dest_to_node_dict) > 50:
                                                 first_key = next(iter(self.dest_to_node_dict))
                                                 self.dest_to_node_dict.pop(first_key, None)
                                         except Exception:
                                             pass
-                                        if from_key:
-                                            self.dest_to_node_dict[dest] = from_key
+                                        try:
+                                            self.dest_to_node_dict[dest_hex] = stored_value
+                                        except Exception:
+                                            pass
                             except Exception:
                                 pass
-                            
+
+                        # Deliver bytes to Reticulum owner inbound
+                        if data_bytes:
                             try:
                                 if hasattr(self.owner, "inbound"):
                                     self.owner.inbound(data_bytes, self)
                                 else:
-                                    RNS.log(f"MeshCore: owner has no inbound method", RNS.LOG_WARNING)
+                                    RNS.log("MeshCore: owner has no inbound method", self._LOG_WARNING)
                             except Exception as e:
                                 RNS.log(f"MeshCore: owner.inbound() failed: {e}", RNS.LOG_ERROR)
-                            
-                    async def _on_new_contact(event):
-                        try:
-                            res = await self.mesh.commands.get_contacts()
-                            if getattr(res, "type", None) != EventType.ERROR:
-                                contacts = getattr(res, "payload", {})
-                                if self.endpoint_contact:
-                                    for key, contact in contacts.items():
-                                        adv = contact.get("adv_name")
-                                        if adv and self.endpoint_contact.lower() in adv.lower():
-                                            self.endpoint_contact = key
-                                            RNS.log(f"MeshCore: using {adv} ({key[:8]}...) as RNS endpoint", RNS.LOG_INFO)
-                                            break
-                                else:
-                                    RNS.log("MeshCore: no endpoint_contact specified; will broadcast by default", RNS.LOG_WARNING)
-                        except Exception as e:
-                            RNS.log(f"MeshCore: get_contacts() failed while selecting endpoint: {e}", RNS.LOG_WARNING)
+                                
+                        async def _on_new_contact(event):
+                            try:
+                                res = await self.mesh.commands.get_contacts()
+                                if getattr(res, "type", None) != EventType.ERROR:
+                                    contacts = getattr(res, "payload", {})
+                                    if self.endpoint_contact:
+                                        for key, contact in contacts.items():
+                                            adv = contact.get("adv_name")
+                                            if adv and self.endpoint_contact.lower() in adv.lower():
+                                                self.endpoint_contact = key
+                                                RNS.log(f"MeshCore: using {adv} ({key[:8]}...) as RNS endpoint", RNS.LOG_INFO)
+                                                break
+                                    else:
+                                        RNS.log("MeshCore: no endpoint_contact specified; will broadcast by default", RNS.LOG_WARNING)
+                            except Exception as e:
+                                RNS.log(f"MeshCore: get_contacts() failed while selecting endpoint: {e}", RNS.LOG_WARNING)
                         
                     try:
                         self.mesh.subscribe(EventType.CONTACT_MSG_RECV, _on_contact_msg)
                         self.mesh.subscribe(EventType.NEW_CONTACT, _on_new_contact)
                         if not self.mesh._event_callbacks.get(EventType.CONTACT_MSG_RECV):
                             RNS.log("MeshCore: no CONTACT_MSG_RECV subscription active!", RNS.LOG_WARNING)
-                    except Exception:
-                        try:
-                            await self.mesh.subscribe(EventType.CONTACT_MSG_RECV, _on_contact_msg)
-                            await self.mesh.subscribe(EventType.NEW_CONTACT, _on_new_contact)
-                            if not self.mesh._event_callbacks.get(EventType.CONTACT_MSG_RECV):
-                                RNS.log("MeshCore: no CONTACT_MSG_RECV subscription active!", RNS.LOG_WARNING)
-                        except Exception as e:
-                            RNS.log(f"Meshcore: subscription to events failed: {e}", RNS.LOG_WARNING)
+                    except Exception as e:
+                        RNS.log(f"Meshcore: subscription to events failed: {e}", RNS.LOG_WARNING)
             
                 except Exception as e:
                     RNS.log(f"MeshCore: subscription to events failed outer: {e}", RNS.LOG_WARNING)
@@ -259,96 +367,97 @@ class MeshCoreInterface(Interface):
         thread.start()
         
     def _outgoing_worker(self):
-        
         while True:
-        
             # Cleanup old stored packets to prevent memory buildup
             if len(self.outgoing_packet_storage) > 512:
                 oldest = list(self.outgoing_packet_storage.keys())[:128]
                 for k in oldest:
                     self.outgoing_packet_storage.pop(k, None)
-        
+
             try:
                 if not self.packet_i_queue:
                     time.sleep(0.05)
                     continue
-                
+
                 index, pos = self.packet_i_queue.pop(0)
                 handler = self.outgoing_packet_storage.get(index, None)
                 if not handler:
                     continue
-                
+
                 data = handler[pos]
                 if not data:
                     continue
-                    
-                dest_key = handler.destination_id or self.endpoint_contact
+
+                # resolve candidate destination (handler.destination_id or endpoint_contact)
+                raw_dest = getattr(handler, "destination_id", None) or self.endpoint_contact
+                dest_key = self._resolve_destination(raw_dest)
+
+                # fallback: try mapping from RNS destination bytes
                 if not dest_key:
                     try:
                         if len(data) >= 18:
                             rns_dest = data[2:18]
-                            dest_key = self.dest_to_node_dict.get(rns_dest, None)
+                            mapped = self.dest_to_node_dict.get(bytes(rns_dest).hex(), None)
+                            dest_key = self._resolve_destination(mapped)
                     except Exception:
                         dest_key = None
-                        
-                try:
-                    if dest_key:
+
+                # attempt single send or broadcast
+                if dest_key:
+                    res = None
+                    try:
+                        RNS.log(f"MeshCore: about to call send_msg(dest type={type(dest_key).__name__}, payload type={type(data.decode('latin-1')).__name__})", RNS.LOG_DEBUG)
+                        payload_for_meshcore = self._payload_for_send(data)   # returns str
+                        res = self._run_coro(self.mesh.commands.send_msg(dest_key, payload_for_meshcore), timeout=8)
+                        # guarded short id for logs
                         try:
-                            fut = self._run_coro(self.mesh.commands.send_msg(dest_key, data), timeout=8)
-                            res = fut
-                        except Exception as e:
-                            RNS.log(f"MeshCore: exception while sending: {e}", RNS.LOG_ERROR)
-                            res = None
-                    else:
-                        res_contacts = None
-                        try:
-                            res_contacts = self._run_coro(self.mesh.commands.get_contacts(), timeout=8)
-                        except Exception as e:
-                            RNS.log(f"MeshCore: could not fetch contacts for broadcast: {e}", RNS.LOG_WARNING)
-                            res_contacts = None
-                        
-                        if not res_contacts:
-                            continue
-                        
-                        if getattr(res_contacts, "type", None) == self._meshcore_EventType.ERROR:
-                            RNS.log("MeshCore: could not fetch contacts for broadcast", RNS.LOG_WARNING)
-                        
-                        contacts = getattr(res_contacts, "payload", {})
-                        for pk, contact in contacts.items():
-                            try:
-                                try:
-                                    self._run_coro(self.mesh.commands.send_msg(contact, data), timeout=8)
-                                except Exception as e:
-                                    RNS.log(f"MeshCore: send_msg to {pk} failed: {e}", RNS.LOG_WARNING)
-                                    continue
-                            except Exception as e:
-                                RNS.log(f"MeshCore: exception while sending to contact {pk}: {e}", RNS.LOG_WARNING)
-                                continue
-                        res = None
-                            
-                    if res is not None and getattr(res, "type", None) == self._meshcore_EventType.ERROR:
-                        RNS.log(f"MeshCore: send_msg returned error: {getattr(res, 'payload', None)}", RNS.LOG_WARNING)
-                except Exception as e:
-                    RNS.log(f"MeshCore: outgoing worker error: {e}", RNS.LOG_ERROR)
-            
+                            if isinstance(dest_key, str):
+                                short = dest_key[:8]
+                            elif isinstance(dest_key, dict):
+                                short = dest_key.get("public_key", "")[:8] or dest_key.get("adv_name", "")[:8]
+                            else:
+                                short = None
+                        except Exception:
+                            short = None
+                        RNS.log(f"MeshCore: sent {len(data)} bytes to {short}", RNS.LOG_DEBUG)
+                    except Exception as e:
+                        RNS.log(f"MeshCore: exception while sending: {e}", RNS.LOG_ERROR)
+                if res is not None and getattr(res, "type", None) == self._meshcore_EventType.ERROR:
+                    RNS.log(f"MeshCore: send_msg returned error: {getattr(res, 'payload', None)}", self._LOG_WARNING)
+                
+#                else:
+                    # broadcast to all contacts
+#                    try:
+#                        res_contacts = self._run_coro(self.mesh.commands.get_contacts(), timeout=8)
+#                    except Exception as e:
+#                        RNS.log(f"MeshCore: could not fetch contacts for broadcast: {e}", self._LOG_WARNING)
+#                        res_contacts = None
+
+#                    if res_contacts and getattr(res_contacts, "type", None) != self._meshcore_EventType.ERROR:
+#                        contacts = getattr(res_contacts, "payload", {}) or {}
+#                        for pk, contact in contacts.items():
+#                            try:
+                                # contact is a contact dict from get_contacts()
+#                                RNS.log(f"MeshCore: about to call send_msg(dest type={type(dest_key).__name__}, payload type={type(data.decode('latin-1')).__name__})", RNS.LOG_DEBUG)
+#                                payload_for_meshcore = self._payload_for_send(data)
+#                                self._run_coro(self.mesh.commands.send_msg(contact, payload_for_meshcore), timeout=8)
+#                                short = pk[:8] if isinstance(pk, str) else None
+#                                RNS.log(f"MeshCore: broadcasted {len(data)} bytes to {short}", RNS.LOG_DEBUG)
+#                            except Exception as e:
+#                                RNS.log(f"MeshCore: send_msg to {pk} failed: {e}", self._LOG_WARNING)
+#                    else:
+#                        RNS.log("MeshCore: no contacts available for broadcast", self._LOG_WARNING)
+
             except Exception as e:
                 RNS.log(f"MeshCore outgoing worker error: {e}", RNS.LOG_ERROR)
-            
-            if self.mesh and dest_key:
-                try:
-                    self._run_coro(self.mesh.commands.send_msg(dest_key, data), timeout=8)
-                    RNS.log(f"MeshCore: sent {len(data)} bytes to {dest_key[:8]}", RNS.LOG_DEBUG)
-                except Exception as e:
-                    RNS.log(f"MeshCore: failed final send: {e}", RNS.LOG_WARNING)
-            
+
             time.sleep(0.05)
 
     def process_outgoing(self, data: bytes):
-        
         if len(self.packet_i_queue) >= 256:
             RNS.log("MeshCore: outgoing queue full, dropping packet", RNS.LOG_WARNING)
             return
-        
+
         dest = None
         try:
             if len(data) >= 18:
@@ -356,7 +465,14 @@ class MeshCoreInterface(Interface):
                 dest = self.dest_to_node_dict.get(rns_dest, None)
         except Exception:
             dest = None
-            
+
+        # Normalize dest to one of: None, contact dict, or public-key hex string
+        if isinstance(dest, (bytes, bytearray)):
+            try:
+                dest = bytes(dest).hex()
+            except Exception:
+                dest = None
+
         handler = PacketHandler(data, self.packet_index, max_payload=160, custom_destination_id=dest)
         for key in handler.get_keys():
             self.packet_i_queue.append((handler.index, key))
