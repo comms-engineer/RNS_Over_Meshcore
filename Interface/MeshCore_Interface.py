@@ -174,32 +174,50 @@ class MeshCoreInterface(Interface):
             return ""
 
     def _payload_from_received(self, payload_obj):
-        """Decode Base64 MeshCore payloads back into raw bytes."""
+        """Decode Base64 MeshCore payloads back into raw bytes.
+        Accepts dict shapes (payload/data/text), raw bytes, or str.
+        If incoming value is raw bytes already, return as-is.
+        If it's a string, try Base64 decode first; on failure fall back to latin-1 bytes.
+        """
         try:
-            encoded = None
+            # If payload already bytes, assume it's the original raw bytes and return them
+            if isinstance(payload_obj, (bytes, bytearray)):
+                return bytes(payload_obj)
+
+            # If it's a dict, pick the first present of (payload, data, text)
             if isinstance(payload_obj, dict):
-                # prefer payload, then data, then text
-                for key in ("payload", "data", "text"):
-                    val = payload_obj.get(key)
+                for k in ("payload", "data", "text"):
+                    val = payload_obj.get(k, None)
+                    if val is None:
+                        continue
+                    # If field contains bytes -> return directly
                     if isinstance(val, (bytes, bytearray)):
                         return bytes(val)
                     if isinstance(val, str):
-                        encoded = val
+                        s = val
                         break
+                else:
+                    s = None
             elif isinstance(payload_obj, str):
-                encoded = payload_obj
+                s = payload_obj
+            else:
+                s = None
 
-            if encoded is not None:
+            if s is None:
+                return None
+
+            # try strict base64 decode first (validate=True will raise on non-base64)
+            try:
+                return base64.b64decode(s, validate=True)
+            except Exception:
+                # not valid base64 — fall back to latin-1 encode (legacy behaviour)
                 try:
-                    return base64.b64decode(encoded, validate=True)
+                    return s.encode("latin-1")
                 except Exception:
-                    # fallback if it wasn't base64
-                    return encoded.encode("latin-1")
-
+                    return s.encode("utf-8", errors="ignore")
         except Exception as e:
-            RNS.log(f"MeshCore: base64 decode failed: {e}", RNS.LOG_ERROR)
-
-        return None
+            RNS.log(f"MeshCore: _payload_from_received unexpected error: {e}", RNS.LOG_ERROR)
+            return None
     
     def _open_serial_and_init(self):
         
