@@ -262,86 +262,50 @@ class MeshCoreInterface(Interface):
                         from_key = None
                         data_bytes = None
                         contact_obj = None
-
-                        # Extract payload and contact/public key info (many meshcore builds use varying shapes)
+                    
+                        # Decode the received MeshCore payload (Base64 to bytes)
+                        data_bytes = self._payload_from_received(payload)
+                        if not data_bytes:
+                            return
+                    
+                        # Extract sender key (optional)
+                        if isinstance(payload, dict):
+                            from_key = payload.get("public_key") or payload.get("pubkey_prefix")
+                            contact_obj = payload.get("contact")
+                    
+                        # Identify the sender ID (as a stable dictionary key)
+                        sender_id = from_key or getattr(event, "from_id", "unknown")
+                    
+                        # Initialize state for this sender
+                        if sender_id not in self.assembly_dict:
+                            self.assembly_dict[sender_id] = {}
+                        assembly = self.assembly_dict[sender_id]
+                    
+                        # Extract metadata (index, pos)
                         try:
-                            if isinstance(payload, dict):
-                                # contact dict may be provided directly
-                                contact_obj = payload.get("contact") if isinstance(payload.get("contact"), dict) else None
-
-                                # public key fields
-                                if isinstance(payload.get("public_key"), str):
-                                    from_key = payload.get("public_key")
-                                elif isinstance(payload.get("pubkey_prefix"), str):
-                                    from_key = payload.get("pubkey_prefix")
-
-                                # try to normalize the payload to bytes using class helper
-                                data_bytes = self._payload_from_received(payload)
-                            elif isinstance(payload, (bytes, bytearray, str)):
-                                data_bytes = self._payload_from_received(payload)
-                        except Exception:
-                            data_bytes = None
-
-                        # If contact object present but no from_key, try to read public_key from it
-                        try:
-                            if not from_key and isinstance(contact_obj, dict):
-                                pk = contact_obj.get("public_key") or contact_obj.get("pubkey_prefix")
-                                if isinstance(pk, str):
-                                    from_key = pk
-                        except Exception:
-                            pass
-
-                        # If we have data bytes, extract RNS dest slice and store mapping
-                        if data_bytes:
-                            RNS.log(f"MeshCore: inbound {len(data_bytes)} bytes (hex start: {data_bytes[:16].hex()})", RNS.LOG_DEBUG)
-                            self.owner.inbound(data_bytes, self)
+                            index, pos = struct.unpack('Bb', data_bytes[:2])
+                            chunk = data_bytes[2:]
+                        except Exception as e:
+                            RNS.log(f"MeshCore: failed to unpack metadata: {e}", RNS.LOG_WARNING)
+                            return
+                    
+                        # Add chunk
+                        if index not in assembly:
+                            assembly[index] = {}
+                        assembly[index][abs(pos)] = chunk
+                    
+                        # If this is the last fragment (pos < 0)
+                        if pos < 0:
                             try:
-                                if len(data_bytes) >= 18:
-                                    rns_dest_bytes = data_bytes[2:18]
-                                    try:
-                                        dest_hex = bytes(rns_dest_bytes).hex()
-                                    except Exception:
-                                        dest_hex = None
-
-                                    # Prefer storing the full contact dict for later send_msg calls if available
-                                    stored_value = None
-                                    if contact_obj:
-                                        stored_value = contact_obj
-                                    else:
-                                        if isinstance(from_key, (bytes, bytearray)):
-                                            try:
-                                                stored_value = bytes(from_key).hex()
-                                            except Exception:
-                                                stored_value = None
-                                        elif isinstance(from_key, str):
-                                            stored_value = from_key.strip()
-
-                                    if dest_hex and stored_value:
-                                        try:
-                                            # bound size to avoid unbounded memory growth
-                                            if len(self.dest_to_node_dict) > 50:
-                                                first_key = next(iter(self.dest_to_node_dict))
-                                                self.dest_to_node_dict.pop(first_key, None)
-                                        except Exception:
-                                            pass
-                                        try:
-                                            self.dest_to_node_dict[dest_hex] = stored_value
-                                        except Exception:
-                                            pass
-                            except Exception:
-                                pass
-
-                        # Deliver bytes to Reticulum owner inbound
-                        if data_bytes:
-                            RNS.log(f"MeshCore: inbound {len(data_bytes)} bytes (hex start: {data_bytes[:16].hex()})", RNS.LOG_DEBUG)
-                            self.owner.inbound(data_bytes, self)
-                            try:
-                                if hasattr(self.owner, "inbound"):
-                                    self.owner.inbound(data_bytes, self)
-                                else:
-                                    RNS.log("MeshCore: owner has no inbound method", self._LOG_WARNING)
+                                # Reassemble all parts
+                                full_data = b''.join(assembly[index][i] for i in sorted(assembly[index].keys()))
+                                self.owner.inbound(full_data, self)
+                                RNS.log(f"MeshCore: reassembled full RNS packet ({len(full_data)} bytes)", RNS.LOG_DEBUG)
                             except Exception as e:
-                                RNS.log(f"MeshCore: owner.inbound() failed: {e}", RNS.LOG_ERROR)
+                                RNS.log(f"MeshCore: reassembly failed: {e}", RNS.LOG_WARNING)
+                            finally:
+                                # Clean up
+                                del assembly[index]
                                 
                         async def _on_new_contact(event):
                             try:
