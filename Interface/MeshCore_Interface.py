@@ -208,13 +208,21 @@ class MeshCoreInterface(Interface):
 
             # try strict base64 decode first (validate=True will raise on non-base64)
             try:
-                return base64.b64decode(s, validate=True)
+                decoded = base64.b64decode(s, validate=True)
+
+                try:
+                    decoded2 = base64.b64decode(decoded, validate=True)
+                    return decoded2
+                except Exception:
+                    return decoded
+                
             except Exception:
                 # not valid base64 — fall back to latin-1 encode (legacy behaviour)
                 try:
                     return s.encode("latin-1")
                 except Exception:
                     return s.encode("utf-8", errors="ignore")
+        
         except Exception as e:
             RNS.log(f"MeshCore: _payload_from_received unexpected error: {e}", RNS.LOG_ERROR)
             return None
