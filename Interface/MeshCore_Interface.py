@@ -174,11 +174,7 @@ class MeshCoreInterface(Interface):
             return ""
 
     def _payload_from_received(self, payload_obj):
-        """Decode Base64 MeshCore payloads back into raw bytes.
-        Accepts dict shapes (payload/data/text), raw bytes, or str.
-        If incoming value is raw bytes already, return as-is.
-        If it's a string, try Base64 decode first; on failure fall back to latin-1 bytes.
-        """
+        """Decode Base64 MeshCore payloads back into raw bytes."""
         try:
             # If payload already bytes, assume it's the original raw bytes and return them
             if isinstance(payload_obj, (bytes, bytearray)):
@@ -205,7 +201,38 @@ class MeshCoreInterface(Interface):
 
             if s is None:
                 return None
-
+            
+            try:
+                # Attempt 1: Standard Base64 Decode
+                # RNS packets are wrapped in a base64 string by MeshCore (via _payload_for_send)
+                decoded = base64.b64decode(s, validate=True)
+                RNS.log(f"MeshCore: Payload decoded (Layer 1 Base64 success, length: {len(decoded)})", RNS.LOG_DEBUG)
+        
+                # Attempt 2: Double Base64 Decode
+                # This occurs if the originating RNS packet fragment itself was Base64 encoded *before* 
+                # being passed to the MeshCore interface's send function.
+                try:
+                    decoded2 = base64.b64decode(decoded, validate=True)
+                    RNS.log("MeshCore: Payload double-decoded (Layer 2 Base64 success)", RNS.LOG_DEBUG)
+                    return decoded2
+                except Exception:
+                    # If second decode fails, the data was only single Base64 encoded.
+                    RNS.log("MeshCore: Layer 2 Base64 decode failed, returning Layer 1 data.", RNS.LOG_DEBUG)
+                    return decoded
+        
+            except Exception as e:
+                RNS.log(f"MeshCore: Layer 1 Base64 decode failed (Payload not strict Base64): {e}", RNS.LOG_DEBUG)
+        
+                # Fallback: not valid Base64 string at all (legacy behaviour or corrupted data)
+                try:
+                    return s.encode("latin-1")
+                except Exception:
+                    return s.encode("utf-8", errors="ignore")
+        
+            except Exception as e:
+                RNS.log(f"MeshCore: _payload_from_received unexpected fatal error: {e}", RNS.LOG_ERROR)
+                return None
+                        
             # try strict base64 decode first (validate=True will raise on non-base64)
             try:
                 decoded = base64.b64decode(s, validate=True)
@@ -275,7 +302,16 @@ class MeshCoreInterface(Interface):
                         data_bytes = self._payload_from_received(payload)
                         if not data_bytes:
                             return
-                    
+
+                        # --- START DEBUG INSERT 1 ---
+                        RNS.log(f"MeshCore: Decoded Payload Size: {len(data_bytes)} bytes", RNS.LOG_DEBUG)
+
+                        # Log the first 4 bytes. If RNS fragmentation is correct, 
+                        # the first 2 bytes are metadata (index, pos).
+                        if data_bytes and len(data_bytes) >= 4:
+                            RNS.log(f"MeshCore: Decoded Data Start (HEX): {data_bytes[:4].hex()}", RNS.LOG_DEBUG)
+                        # --- END DEBUG INSERT 1 ---
+
                         # Extract sender key (optional)
                         if isinstance(payload, dict):
                             from_key = payload.get("public_key") or payload.get("pubkey_prefix")
@@ -293,8 +329,19 @@ class MeshCoreInterface(Interface):
                         try:
                             index, pos = struct.unpack('Bb', data_bytes[:2])
                             chunk = data_bytes[2:]
+                        
                         except Exception as e:
-                            RNS.log(f"MeshCore: failed to unpack metadata: {e}", RNS.LOG_WARNING)
+                            # --- START DEBUG INSERT 2 (Enhanced Error Logging) ---
+                            if data_bytes:
+                                error_data_hex = data_bytes.hex()
+                            else:
+                                error_data_hex = "None"
+                                
+                            RNS.log(f"MeshCore: FAILED to unpack metadata ('Bb'): {e}", RNS.LOG_WARNING)
+                            RNS.log(f"MeshCore: Failing data length: {len(data_bytes)} bytes", RNS.LOG_WARNING)
+                            # Log the first 100 characters of the raw hex data that caused the structural failure
+                            RNS.log(f"MeshCore: Failing data bytes start (HEX): {error_data_hex[:200]}...", RNS.LOG_WARNING)
+                            # --- END DEBUG INSERT 2 ---
                             return
                     
                         # Add chunk
