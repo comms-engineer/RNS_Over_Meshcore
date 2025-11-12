@@ -166,94 +166,53 @@ class MeshCoreInterface(Interface):
         return 
     
     def _payload_for_send(self, data: bytes) -> str:
-        """Encode binary data as Base64 string for MeshCore transmission."""
+        """Encode binary data as Base64 string for MeshCore transmission.
+        RNS hands us binary frames; MeshCore expects an ASCII-safe string.
+        """
         try:
-            return base64.b64encode(data).decode("ascii")
+            encoded = base64.b64encode(data).decode("ascii")
+            RNS.log(f"MeshCore: Encoded outgoing payload ({len(data)} → {len(encoded)} chars)", RNS.LOG_DEBUG)
+            return encoded
         except Exception as e:
             RNS.log(f"MeshCore: base64 encode failed: {e}", RNS.LOG_ERROR)
             return ""
 
     def _payload_from_received(self, payload_obj):
-        """Decode Base64 MeshCore payloads back into raw bytes."""
+        """Decode a single-layer Base64 MeshCore payload into raw bytes.
+        MeshCore delivers Base64-wrapped RNS frames as strings; 
+        only one decode is needed before passing to Reticulum.
+        """
         try:
-            # If payload already bytes, assume it's the original raw bytes and return them
-            if isinstance(payload_obj, (bytes, bytearray)):
-                return bytes(payload_obj)
-
-            # If it's a dict, pick the first present of (payload, data, text)
+            # 1️⃣ Extract the relevant field from dicts
             if isinstance(payload_obj, dict):
                 for k in ("payload", "data", "text"):
-                    val = payload_obj.get(k, None)
-                    if val is None:
-                        continue
-                    # If field contains bytes -> return directly
-                    if isinstance(val, (bytes, bytearray)):
-                        return bytes(val)
-                    if isinstance(val, str):
-                        s = val
+                    val = payload_obj.get(k)
+                    if val is not None:
+                        payload_obj = val
                         break
-                else:
-                    s = None
-            elif isinstance(payload_obj, str):
-                s = payload_obj
-            else:
-                s = None
 
-            if s is None:
+            # 2️⃣ Normalize to string
+            if isinstance(payload_obj, (bytes, bytearray)):
+                return bytes(payload_obj)
+            elif not isinstance(payload_obj, str):
                 return None
-            
-            try:
-                # Attempt 1: Standard Base64 Decode
-                # RNS packets are wrapped in a base64 string by MeshCore (via _payload_for_send)
-                decoded = base64.b64decode(s, validate=True)
-                RNS.log(f"MeshCore: Payload decoded (Layer 1 Base64 success, length: {len(decoded)})", RNS.LOG_DEBUG)
-        
-                # Attempt 2: Double Base64 Decode
-                # This occurs if the originating RNS packet fragment itself was Base64 encoded *before* 
-                # being passed to the MeshCore interface's send function.
-                try:
-                    decoded2 = base64.b64decode(decoded, validate=True)
-                    RNS.log("MeshCore: Payload double-decoded (Layer 2 Base64 success)", RNS.LOG_DEBUG)
-                    return decoded2
-                except Exception:
-                    # If second decode fails, the data was only single Base64 encoded.
-                    RNS.log("MeshCore: Layer 2 Base64 decode failed, returning Layer 1 data.", RNS.LOG_DEBUG)
-                    return decoded
-        
-            except Exception as e:
-                RNS.log(f"MeshCore: Layer 1 Base64 decode failed (Payload not strict Base64): {e}", RNS.LOG_DEBUG)
-        
-                # Fallback: not valid Base64 string at all (legacy behaviour or corrupted data)
-                try:
-                    return s.encode("latin-1")
-                except Exception:
-                    return s.encode("utf-8", errors="ignore")
-        
-            except Exception as e:
-                RNS.log(f"MeshCore: _payload_from_received unexpected fatal error: {e}", RNS.LOG_ERROR)
-                return None
-                        
-            # try strict base64 decode first (validate=True will raise on non-base64)
+
+            s = payload_obj.strip()
+
+            # 3️⃣ Try single Base64 decode
             try:
                 decoded = base64.b64decode(s, validate=True)
-
-                try:
-                    decoded2 = base64.b64decode(decoded, validate=True)
-                    return decoded2
-                except Exception:
-                    return decoded
-                
+                RNS.log(f"MeshCore: Single-layer Base64 decode OK ({len(s)} → {len(decoded)} bytes)", RNS.LOG_DEBUG)
+                return decoded
             except Exception:
-                # not valid base64 — fall back to latin-1 encode (legacy behaviour)
-                try:
-                    return s.encode("latin-1")
-                except Exception:
-                    return s.encode("utf-8", errors="ignore")
-        
+                # Not valid Base64 — likely a plaintext message like “test”
+                RNS.log("MeshCore: Not Base64, using latin-1 fallback", RNS.LOG_DEBUG)
+                return s.encode("latin-1", errors="ignore")
+
         except Exception as e:
-            RNS.log(f"MeshCore: _payload_from_received unexpected error: {e}", RNS.LOG_ERROR)
+            RNS.log(f"MeshCore: _payload_from_received error: {e}", RNS.LOG_ERROR)
             return None
-    
+            
     def _open_serial_and_init(self):
         
         meshcore = self._meshcore_module
