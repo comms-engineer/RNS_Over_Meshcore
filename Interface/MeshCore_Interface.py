@@ -7,7 +7,6 @@
 # endpoint_contact = None
 
 # MeshCore_Interface.py
-# Full replacement MeshCore <-> Reticulum interface with configurable debug and endpoint behaviour.
 
 import asyncio
 import threading
@@ -583,21 +582,21 @@ class MeshCoreInterface(Interface):
     def _start_outgoing_worker(self):
         thread = threading.Thread(target=self._outgoing_worker, daemon=True, name=f"meshcore-out-{self.name}")
         thread.start()
-
-    def _outgoing_worker(self):
+    
+        def _outgoing_worker(self):
         """
         Worker thread that pulls fragments from packet_i_queue and sends them via meshcore.
         All meshcore coroutines are executed on the background asyncio loop using _run_coro.
         """
         meshcore = self._meshcore_module
         EventType = self._meshcore_EventType
-
+    
         while True:
             try:
                 if not self.packet_i_queue:
                     time.sleep(0.03)
                     continue
-
+    
                 index, pos = self.packet_i_queue.pop(0)
                 handler = self.outgoing_packet_storage.get(index, None)
                 if not handler:
@@ -605,78 +604,37 @@ class MeshCoreInterface(Interface):
                 data = handler[pos]
                 if not data:
                     continue
-
-                # Determine destination
-                raw_dest = getattr(handler, "destination_id", None) or self.endpoint_contact
+    
+                # Destination is strictly the configured endpoint_contact
                 dest_key = None
-
-                # If explicit custom destination provided by handler, resolve it (hex string or contact dict)
-                if raw_dest:
-                    dest_key = self._resolve_destination(raw_dest)
-
-                # If no explicit dest_key resolved, try to map RNS destination embedded in payload (if present)
-                if not dest_key:
-                    try:
-                        if len(data) >= 18:
-                            rns_dest = data[2:18]
-                            mapped = self.dest_to_node_dict.get(bytes(rns_dest).hex(), None) or self.dest_to_node_dict.get(bytes(rns_dest).hex()[:8], None)
-                            if mapped:
-                                dest_key = self._resolve_destination(mapped)
-                    except Exception:
-                        pass
-
-                # If endpoint_contact configured (string) and still no dest, use it as last resort (restrict outbound)
-                if not dest_key and self.endpoint_contact:
+                if self.endpoint_contact:
                     dest_key = self._resolve_destination(self.endpoint_contact)
-
-                # If still no dest_key then treat as broadcast attempt if allowed (here we will attempt broadcast to all known contacts)
+    
                 if not dest_key:
-                    # user may wish to avoid broadcasting; we will attempt "broadcast" by iterating contacts
-                    try:
-                        # fetch contacts from meshcore and send to each contact
-                        res_contacts = self._run_coro(self.mesh.commands.get_contacts(), timeout=8)
-                        if getattr(res_contacts, "type", None) != EventType.ERROR:
-                            contacts = getattr(res_contacts, "payload", {}) or {}
-                            for pk, contact in contacts.items():
-                                try:
-                                    payload_for_meshcore = self._payload_for_send(data)
-                                    self._run_coro(self.mesh.commands.send_msg(contact, payload_for_meshcore), timeout=8)
-                                    if self.debug_level in ("info", "debug"):
-                                        _safe_log(self._LOG_INFO, f"MeshCore: broadcasted fragment ({len(data)} bytes) to {pk[:8]}")
-                                except Exception as e:
-                                    if self.debug_level == "debug":
-                                        _safe_log(self._LOG_WARNING, f"MeshCore: broadcast fragment to {pk[:8]} failed: {e}")
-                        else:
-                            if self.debug_level in ("info", "debug"):
-                                _safe_log(self._LOG_WARNING, "MeshCore: no contacts available for broadcast")
-                    except Exception as e:
-                        if self.debug_level in ("info", "debug"):
-                            _safe_log(self._LOG_WARNING, f"MeshCore: broadcast attempt failed: {e}")
-                    continue  # move to next fragment
-
-                # Finally send to resolved dest
+                    _safe_log(self._LOG_WARNING,
+                        f"MeshCoreInterface: outbound packet dropped, no valid endpoint_contact resolved")
+                    continue
+    
+                # Prepare payload
+                payload_str = self._payload_for_send(data)
+    
+                # Send via meshcore
                 try:
-                    payload_for_meshcore = self._payload_for_send(data)
-                    res = self._run_coro(self.mesh.commands.send_msg(dest_key, payload_for_meshcore), timeout=8)
+                    res = self._run_coro(self.mesh.commands.send_msg(dest_key, payload_str))
                     if getattr(res, "type", None) == EventType.ERROR:
-                        _safe_log(self._LOG_WARNING, f"MeshCore: send_msg returned error: {getattr(res, 'payload', None)}")
+                        _safe_log(self._LOG_WARNING,
+                            f"MeshCoreInterface: send_msg returned error: {getattr(res, 'payload', None)}")
                     else:
                         if self.debug_level in ("info", "debug"):
-                            short = None
-                            try:
-                                if isinstance(dest_key, str):
-                                    short = dest_key[:12]
-                                elif isinstance(dest_key, dict):
-                                    short = dest_key.get("public_key", "")[:12] or dest_key.get("adv_name", "")[:12]
-                            except Exception:
-                                pass
-                            _safe_log(self._LOG_INFO, f"MeshCore: sent fragment ({len(data)} bytes) to {short}")
+                            _safe_log(self._LOG_INFO,
+                                f"MeshCoreInterface: sent fragment idx={index} pos={pos} to {str(dest_key)[:12]}...")
                 except Exception as e:
-                    _safe_log(self._LOG_ERROR, f"MeshCore: exception while sending fragment: {e}\n{traceback.format_exc()}")
-
+                    _safe_log(self._LOG_WARNING,
+                        f"MeshCoreInterface: send_msg exception: {e}\n{traceback.format_exc()}")
+    
             except Exception as e:
-                _safe_log(self._LOG_ERROR, f"MeshCore outgoing worker error: {e}\n{traceback.format_exc()}")
-
+                _safe_log(self._LOG_WARNING,
+                    f"MeshCoreInterface: outgoing_worker loop exception: {e}\n{traceback.format_exc()}")
             time.sleep(0.02)
 
     def _resolve_destination(self, raw_dest):
