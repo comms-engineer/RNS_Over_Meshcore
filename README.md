@@ -1,6 +1,11 @@
 # RNS_Over_Meshtastic
 
-IGNORE THIS FOR NOW - IT'S ACTIVELY IN WORK AND NON-FUNCTIONAL
+This interface is now minimally functional. More to follow.
+
+- To Do:
+  Disable broadcast sending - don't want to flood a meshcore network if you don't know who your endpoint is
+  User instructions
+  <stuff I can't think of right now>
 
 Interface for RNS using MeshCore as the underlying networking layer to utilize existing MeshCore networks.
 
@@ -19,9 +24,8 @@ Interface for RNS using MeshCore as the underlying networking layer to utilize e
   type = MeshCore_Interface
   enabled = true
   mode = gateway
-  port = /dev/[path to device]  # Optional: Meshtastic serial device port
+  port = /dev/[path to device]
   speed = 115200
 ```
 
-- Radio settings should be able to be defined in the config entry, but I haven't tried it.
-```
+Yes, I absolutely had help from ChatGPT and Copilot on this. I'm not a software person, I'm just dumb enough to think I can beat my head against something until it works. PLEASE feel free to offer improvements and corrections.
