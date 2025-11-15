@@ -584,59 +584,59 @@ class MeshCoreInterface(Interface):
         thread.start()
     
     def _outgoing_worker(self):
-    """
-    Worker thread that pulls fragments from packet_i_queue and sends them via meshcore.
-    All meshcore coroutines are executed on the background asyncio loop using _run_coro.
-    """
-    meshcore = self._meshcore_module
-    EventType = self._meshcore_EventType
-
-    while True:
-        try:
-            if not self.packet_i_queue:
-                time.sleep(0.03)
-                continue
-
-            index, pos = self.packet_i_queue.pop(0)
-            handler = self.outgoing_packet_storage.get(index, None)
-            if not handler:
-                continue
-            data = handler[pos]
-            if not data:
-                continue
-
-            # Destination is strictly the configured endpoint_contact
-            dest_key = None
-            if self.endpoint_contact:
-                dest_key = self._resolve_destination(self.endpoint_contact)
-
-            if not dest_key:
-                _safe_log(self._LOG_WARNING,
-                    f"MeshCoreInterface: outbound packet dropped, no valid endpoint_contact resolved")
-                continue
-
-            # Prepare payload
-            payload_str = self._payload_for_send(data)
-
-            # Send via meshcore
+        """
+        Worker thread that pulls fragments from packet_i_queue and sends them via meshcore.
+        All meshcore coroutines are executed on the background asyncio loop using _run_coro.
+        """
+        meshcore = self._meshcore_module
+        EventType = self._meshcore_EventType
+    
+        while True:
             try:
-                res = self._run_coro(self.mesh.commands.send_msg(dest_key, payload_str))
-                if getattr(res, "type", None) == EventType.ERROR:
+                if not self.packet_i_queue:
+                    time.sleep(0.03)
+                    continue
+    
+                index, pos = self.packet_i_queue.pop(0)
+                handler = self.outgoing_packet_storage.get(index, None)
+                if not handler:
+                    continue
+                data = handler[pos]
+                if not data:
+                    continue
+    
+                # Destination is strictly the configured endpoint_contact
+                dest_key = None
+                if self.endpoint_contact:
+                    dest_key = self._resolve_destination(self.endpoint_contact)
+    
+                if not dest_key:
                     _safe_log(self._LOG_WARNING,
-                        f"MeshCoreInterface: send_msg returned error: {getattr(res, 'payload', None)}")
-                else:
-                    if self.debug_level in ("info", "debug"):
-                        _safe_log(self._LOG_INFO,
-                            f"MeshCoreInterface: sent fragment idx={index} pos={pos} to {str(dest_key)[:12]}...")
+                        f"MeshCoreInterface: outbound packet dropped, no valid endpoint_contact resolved")
+                    continue
+    
+                # Prepare payload
+                payload_str = self._payload_for_send(data)
+    
+                # Send via meshcore
+                try:
+                    res = self._run_coro(self.mesh.commands.send_msg(dest_key, payload_str))
+                    if getattr(res, "type", None) == EventType.ERROR:
+                        _safe_log(self._LOG_WARNING,
+                            f"MeshCoreInterface: send_msg returned error: {getattr(res, 'payload', None)}")
+                    else:
+                        if self.debug_level in ("info", "debug"):
+                            _safe_log(self._LOG_INFO,
+                                f"MeshCoreInterface: sent fragment idx={index} pos={pos} to {str(dest_key)[:12]}...")
+                except Exception as e:
+                    _safe_log(self._LOG_WARNING,
+                        f"MeshCoreInterface: send_msg exception: {e}\n{traceback.format_exc()}")
+    
             except Exception as e:
                 _safe_log(self._LOG_WARNING,
-                    f"MeshCoreInterface: send_msg exception: {e}\n{traceback.format_exc()}")
-
-        except Exception as e:
-            _safe_log(self._LOG_WARNING,
-                f"MeshCoreInterface: outgoing_worker loop exception: {e}\n{traceback.format_exc()}")
-        time.sleep(0.02)
-
+                    f"MeshCoreInterface: outgoing_worker loop exception: {e}\n{traceback.format_exc()}")
+            time.sleep(0.02)
+    
     def _resolve_destination(self, raw_dest):
         """
         Resolve a raw destination (pubkey hex, short prefix, or contact dict)
