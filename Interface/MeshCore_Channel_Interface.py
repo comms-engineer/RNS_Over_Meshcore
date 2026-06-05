@@ -11,7 +11,7 @@ WIRE FORMAT
 ===========
 Binary header (9 bytes) + payload, then base64-encoded and prefixed "RNS:":
 
-  [magic:2B][src_id:4B][pkt_id:1B][frag_idx:1B][frag_total:1B][payload:N]
+  [magic:2B][frag_idx:1B][src_id:4B][pkt_id:1B][frag_total:1B][payload:N]
 
   magic      = b'RN'
   src_id     = stable 4-byte local node ID  (MeshCore channel messages do NOT
@@ -72,8 +72,8 @@ CONFIG STANZA — direct radio (serial example)
     transport = serial
     port = /dev/ttyUSB0
     baudrate = 115200
-    channel_idx    = 1
-    channel_name   = RNS
+    channel_idx    = 39
+    channel_name   = RNSTunnel
     channel_secret = c4d2b6c8254e3b11200f57e95dcb1197
     fragment_delay  = 1.5
     fragment_timeout = 3600
@@ -87,7 +87,7 @@ CONFIG STANZA — RemoteTerm mode (HTTP)
     enabled = yes
     transport        = remoteterm
     remoteterm_url   = http://localhost:8000
-    channel_name     = RNS
+    channel_name     = RNSTunnel
     channel_secret   = c4d2b6c8254e3b11200f57e95dcb1197
     fragment_delay   = 1.5
     fragment_timeout = 3600
@@ -102,7 +102,7 @@ CONFIG STANZA — RemoteTerm mode (HTTPS / self-signed cert)
     transport             = remoteterm
     remoteterm_url        = https://host.docker.internal:8000
     remoteterm_ssl_verify = false   # set false for self-signed certs
-    channel_name          = RNS
+    channel_name          = RNSTunnel
     channel_secret        = c4d2b6c8254e3b11200f57e95dcb1197
     fragment_delay        = 1.5
     fragment_timeout      = 3600
@@ -112,7 +112,7 @@ CONFIG STANZA — RemoteTerm mode (HTTPS / self-signed cert)
 IMPORTANT NOTE ON channel_idx vs. channel_key
 ==============================================
 In direct (serial/ble/tcp) mode, the channel is identified by its slot index
-on the radio (channel_idx, default 1).
+on the radio (channel_idx, default 39).
 
 In RemoteTerm mode, RemoteTerm manages slot assignments internally and
 loads channels into slot 0 temporarily on every send.  You do NOT need
@@ -149,7 +149,7 @@ class _PacketHandler:
 
     MAGIC        = b'RN'
     HEADER_SIZE  = 9       # magic(2) + src_id(4) + pkt_id(1) + idx(1) + total(1)
-    PAYLOAD_SIZE = 96     # conservative; need to experiment more with this.
+    PAYLOAD_SIZE = 64     # conservative; "RNS:" + base64(9+120) = 176 chars < 200 limit
     MSG_PREFIX   = "RNS:"
 
     def __init__(self, data: bytes, src_id: bytes, pkt_id: int):
@@ -161,8 +161,9 @@ class _PacketHandler:
 
         for idx, chunk in enumerate(raw_chunks):
             header = (self.MAGIC
+                      + bytes([idx & 0xFF])
                       + src_id
-                      + bytes([pkt_id & 0xFF, idx & 0xFF, total & 0xFF]))
+                      + bytes([pkt_id & 0xFF, total & 0xFF]))
             self.fragments.append(
                 self.MSG_PREFIX + base64.urlsafe_b64encode(header + chunk).rstrip(b"=").decode()
             )
@@ -213,7 +214,7 @@ class MeshCore_Channel_Interface(Interface):
         self.host        = cfg.get("host",     "127.0.0.1")
         self.tcp_port    = int(cfg.get("tcp_port", 4403))
         self.ble_name    = cfg.get("ble_name", "")
-        self.channel_idx = int(str(cfg.get("channel_idx", 1)).strip())
+        self.channel_idx = int(str(cfg.get("channel_idx", 39)).strip())
 
         # ---- RemoteTerm params ----
         rt_url = cfg.get("remoteterm_url", "http://localhost:8000").rstrip("/")
@@ -249,7 +250,7 @@ class MeshCore_Channel_Interface(Interface):
             self._rt_ssl_ctx = None
 
         # ---- channel (both modes) ----
-        self.channel_name       = cfg.get("channel_name",   "RNS")
+        self.channel_name       = cfg.get("channel_name",   "RNSTunnel")
         self.channel_secret_hex = cfg.get("channel_secret",
                                           "c4d2b6c8254e3b11200f57e95dcb1197")
 
@@ -265,7 +266,7 @@ class MeshCore_Channel_Interface(Interface):
         self.radio_cr   = int(cfg.get("cr",     0))
 
         # ---- reliability / pacing ----
-        self.fragment_delay_s   = float(cfg.get("fragment_delay",   1.5))
+        self.fragment_delay_s   = float(cfg.get("fragment_delay",   2.5))
         self.fragment_timeout_s = float(cfg.get("fragment_timeout", 3600))
         self.rate_limit_bps     = int(cfg.get("rate_limit",         0))
 
@@ -851,9 +852,9 @@ class MeshCore_Channel_Interface(Interface):
             return
 
         magic      = raw[0:2]
-        src_id     = raw[2:6]
-        pkt_id     = raw[6]
-        frag_idx   = raw[7]
+        frag_idx   = raw[2]
+        src_id     = raw[3:7]
+        pkt_id     = raw[7]
         frag_total = raw[8]
         payload    = raw[self.HEADER_SIZE:]
 
