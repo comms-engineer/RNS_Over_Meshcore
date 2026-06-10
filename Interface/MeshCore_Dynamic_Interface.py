@@ -130,20 +130,82 @@ INFRASTRUCTURE / TRANSPORT NODE  (fixed gateway with backbone connectivity)
       announce_rate_grace   = 2      # violations tolerated before enforcement
       announce_rate_penalty = 7200   # extended quiet period after a violation
 
-  Example:
-      [[MeshCore Dynamic Interface]]
-        type = MeshCore_Dynamic_Interface
-        mode = access_point
-        can_route = yes
-        outgoing_announce_rate = 600
-        outgoing_path_req_rate = 1800
-
-      [[Backbone Interface]]
-        type = BackboneInterface
-        mode = boundary
-        announce_rate_target  = 3600
-        announce_rate_grace   = 2
-        announce_rate_penalty = 7200
+  Full example — infrastructure / transport node
+  ┌─────────────────────────────────────────────────────────────────────────┐
+  │ [reticulum]                                                             │
+  │   enable_transport = yes                                                │
+  │   share_instance = yes                                                  │
+  │                                                                         │
+  │ [logging]                                                               │
+  │   loglevel = 4    # increase to 7 for debug                            │
+  │                                                                         │
+  │ [interfaces]                                                            │
+  │                                                                         │
+  │   [[MeshCore Dynamic Interface]]                                        │
+  │     type = MeshCore_Dynamic_Interface                                   │
+  │     interface_enabled = yes                                             │
+  │                                                                         │
+  │     # Role                                                              │
+  │     mode = access_point                                                 │
+  │     can_route = yes                                                     │
+  │                                                                         │
+  │     # Transport — uncomment exactly one block                          │
+  │     # Serial (most common):                                             │
+  │     transport = serial                                                  │
+  │     port = /dev/ttyUSB0    # adjust to your serial device              │
+  │     baudrate = 115200                                                   │
+  │     #                                                                   │
+  │     # TCP (MeshCore node reachable over IP):                           │
+  │     # transport = tcp                                                   │
+  │     # host = 127.0.0.1                                                 │
+  │     # tcp_port = 4403                                                   │
+  │     #                                                                   │
+  │     # BLE:                                                              │
+  │     # transport = ble                                                   │
+  │     # ble_name =           # blank = connect to first found device     │
+  │                                                                         │
+  │     # Channel — all nodes on the same tunnel must share these values   │
+  │     channel_idx = 0                                                     │
+  │     channel_name = RNSTunnel                                            │
+  │     channel_secret = <32 hex chars>  # openssl rand -hex 16           │
+  │                                                                         │
+  │     # Radio overrides — all four must be non-zero to take effect.      │
+  │     # Leave commented to use the values stored on the MeshCore node.   │
+  │     # freq = 915.0         # MHz centre frequency                      │
+  │     # bw   = 250.0         # kHz bandwidth  (125 / 250 / 500)         │
+  │     # sf   = 10            # spreading factor (7–12)                   │
+  │     # cr   = 5             # coding rate denominator (5=4/5 … 8=4/8)  │
+  │                                                                         │
+  │     # Fragmentation                                                     │
+  │     payload_size = 64      # bytes/fragment (see PAYLOAD SIZE note)    │
+  │     fragment_delay = 2.5   # seconds between channel-mode fragments    │
+  │     direct_frag_delay = 0.5  # seconds between direct-message frags   │
+  │     fragment_timeout = 3600  # seconds before stale frags discarded    │
+  │                                                                         │
+  │     # Outgoing rate limiting (set to 0 to disable)                     │
+  │     outgoing_announce_rate = 600    # min s between announces per dest │
+  │     outgoing_path_req_rate = 1800   # min s between path reqs per dest │
+  │                                                                         │
+  │     # Optional hard bandwidth cap in bits per second (0 = disabled)    │
+  │     # rate_limit = 1200                                                 │
+  │                                                                         │
+  │     # Peer discovery                                                    │
+  │     allow_direct = yes      # use unicast direct msgs when route known │
+  │     peer_ttl = 86400        # seconds before a silent peer expires     │
+  │                                                                         │
+  │     debug_level = info      # info | debug                             │
+  │                                                                         │
+  │   [[Backbone Interface]]                                                │
+  │     type = BackboneInterface                                            │
+  │     interface_enabled = yes                                             │
+  │     mode = boundary                                                     │
+  │     target_host = <backbone-server-hostname-or-ip>                     │
+  │     target_port = 4242                                                  │
+  │     # Rate-limit announce re-propagation from the fast network         │
+  │     announce_rate_target  = 3600                                        │
+  │     announce_rate_grace   = 2                                           │
+  │     announce_rate_penalty = 7200                                        │
+  └─────────────────────────────────────────────────────────────────────────┘
 
 MOBILE / CLIENT NODE  (portable device, no guaranteed upstream connectivity)
 ──────────────────────────────────────────────────────────────────────────────
@@ -167,26 +229,101 @@ MOBILE / CLIENT NODE  (portable device, no guaranteed upstream connectivity)
     go offline.  A value matching the expected maximum offline duration of the
     device is appropriate (e.g. 7200 s for a device used within a single day).
 
-  If the mobile node hosts a hotspot for downstream client devices, add a
-  server interface for the hotspot network:
+  If the mobile node hosts a hotspot for downstream client devices (phones,
+  laptops), add a server interface on the hotspot subnet.  Use TCPServerInterface
+  for explicit client configuration, or AutoInterface for zero-config mDNS
+  discovery (supported by Sideband and NomadNet).
 
-      [[Hotspot Interface]]
-        type = TCPServerInterface   (or AutoInterface on the hotspot subnet)
-        mode = access_point
-        enabled = true
-        listen_ip = 192.168.x.x    (hotspot gateway address)
-        listen_port = 4242
-
-  Example:
-      [[MeshCore Dynamic Interface]]
-        type = MeshCore_Dynamic_Interface
-        mode = roaming
-        can_route = no
-        peer_ttl = 7200
-
-      [[Backbone Interface]]
-        type = BackboneInterface
-        mode = boundary
+  Full example — mobile / edge node
+  ┌─────────────────────────────────────────────────────────────────────────┐
+  │ [reticulum]                                                             │
+  │   enable_transport = yes                                                │
+  │   share_instance = yes                                                  │
+  │                                                                         │
+  │ [logging]                                                               │
+  │   loglevel = 4                                                          │
+  │                                                                         │
+  │ [interfaces]                                                            │
+  │                                                                         │
+  │   [[MeshCore Dynamic Interface]]                                        │
+  │     type = MeshCore_Dynamic_Interface                                   │
+  │     interface_enabled = yes                                             │
+  │                                                                         │
+  │     # Role                                                              │
+  │     mode = roaming                                                      │
+  │     can_route = no                                                      │
+  │                                                                         │
+  │     # Transport — uncomment exactly one block                          │
+  │     # Serial:                                                           │
+  │     transport = serial                                                  │
+  │     port = /dev/ttyACM0                                                 │
+  │     baudrate = 115200                                                   │
+  │     #                                                                   │
+  │     # TCP:                                                              │
+  │     # transport = tcp                                                   │
+  │     # host = 127.0.0.1                                                 │
+  │     # tcp_port = 4403                                                   │
+  │     #                                                                   │
+  │     # BLE:                                                              │
+  │     # transport = ble                                                   │
+  │     # ble_name =           # blank = connect to first found device     │
+  │                                                                         │
+  │     # Channel — must match all other nodes on the tunnel               │
+  │     channel_idx = 0                                                     │
+  │     channel_name = RNSTunnel                                            │
+  │     channel_secret = <same key as infrastructure node>                 │
+  │                                                                         │
+  │     # Radio overrides (leave commented to use stored node values)      │
+  │     # freq = 915.0                                                      │
+  │     # bw   = 250.0                                                      │
+  │     # sf   = 10                                                         │
+  │     # cr   = 5                                                          │
+  │                                                                         │
+  │     # Fragmentation                                                     │
+  │     payload_size = 64                                                   │
+  │     fragment_delay = 2.5                                                │
+  │     direct_frag_delay = 0.5                                             │
+  │     fragment_timeout = 3600                                             │
+  │                                                                         │
+  │     # Outgoing rate limiting                                            │
+  │     outgoing_announce_rate = 600                                        │
+  │     outgoing_path_req_rate = 1800                                       │
+  │                                                                         │
+  │     # Peer discovery                                                    │
+  │     allow_direct = yes                                                  │
+  │     peer_ttl = 7200        # short TTL for intermittently-connected    │
+  │                            # devices; adjust to max expected offline   │
+  │                            # window (seconds)                          │
+  │                                                                         │
+  │     debug_level = info                                                  │
+  │                                                                         │
+  │   # Backbone — disable when operating away from the home network.      │
+  │   # Enable when connected to a fixed LAN with upstream transport.      │
+  │   [[Backbone Interface]]                                                │
+  │     type = BackboneInterface                                            │
+  │     interface_enabled = no   # toggle yes when on home LAN             │
+  │     mode = boundary                                                     │
+  │     target_host = <backbone-server-hostname-or-ip>                     │
+  │     target_port = 4242                                                  │
+  │                                                                         │
+  │   # Hotspot server — for phones or laptops connected to this node's    │
+  │   # WiFi AP.  Use the hotspot gateway IP as listen_ip.                 │
+  │   # Option A: explicit TCP (client must configure server address)      │
+  │   [[Hotspot TCP Server]]                                                │
+  │     type = TCPServerInterface                                           │
+  │     interface_enabled = yes                                             │
+  │     mode = access_point                                                 │
+  │     listen_ip = 192.168.4.1                                             │
+  │     listen_port = 4242                                                  │
+  │                                                                         │
+  │   # Option B: AutoInterface (zero-config mDNS discovery)               │
+  │   # [[Hotspot AutoInterface]]                                           │
+  │   #   type = AutoInterface                                              │
+  │   #   interface_enabled = yes                                           │
+  │   #   mode = access_point                                               │
+  │   #   devices = wlan0      # hotspot interface name                    │
+  │   #   outgoing = yes                                                    │
+  └─────────────────────────────────────────────────────────────────────────┘
 """
 
 import RNS
