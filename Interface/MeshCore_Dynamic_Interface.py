@@ -745,7 +745,7 @@ class MeshCore_Dynamic_Interface(Interface):
 
         # The direct-message receive event name varies across library versions.
         _direct_recv_et = None
-        for _name in ("DIRECT_MSG_RECV", "PRIVATE_MSG_RECV",
+        for _name in ("CONTACT_MSG_RECV", "DIRECT_MSG_RECV", "PRIVATE_MSG_RECV",
                       "MSG_RECV", "PRIV_MSG_RECV"):
             _direct_recv_et = getattr(ET, _name, None)
             if _direct_recv_et is not None:
