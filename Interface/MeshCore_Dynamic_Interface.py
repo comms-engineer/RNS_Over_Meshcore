@@ -1323,17 +1323,37 @@ class MeshCore_Dynamic_Interface(Interface):
 
         # Resolve a unicast next-hop from the cached RNS→MC route map.
         target_key = None
-        if not broadcast and self._has_direct_api and len(data) >= 11:
+        channel_reason = ""
+
+        if broadcast:
+            channel_reason = "Mandatory broadcast packet (e.g., Announce)"
+        elif not self._has_direct_api:
+            channel_reason = "Direct routing API disabled or undetected by interface"
+        elif len(data) < 11:
+            channel_reason = f"Packet too short to extract origin token (len: {len(data)})"
+        else:
             next_hop_token = bytes(data[1:11])
             with self._peer_lock:
                 target_key = self._rns_to_mc_map.get(next_hop_token)
+            if not target_key:
+                channel_reason = f"No direct route bound for RNS token {next_hop_token.hex()[:8]}"
 
-        route = (
-            [("channel", None)]
-            if broadcast or not self._has_direct_api or not target_key
-            else [("direct", target_key)]
-        )
-
+        # Apply routing decision and log the result
+        if channel_reason:
+            RNS.log(
+                f"MeshCore_Dynamic_Interface [{self.name}]: "
+                f"Routing -> CHANNEL. Reason: {channel_reason}",
+                RNS.LOG_INFO
+            )
+            route = [("channel", None)]
+        else:
+            RNS.log(
+                f"MeshCore_Dynamic_Interface [{self.name}]: "
+                f"Routing -> DIRECT via peer key {target_key[:12]}...",
+                RNS.LOG_INFO
+            )
+            route = [("direct", target_key)]
+            
         for frag_str in handler.fragments:
             for mode, target in route:
                 self._loop.call_soon_threadsafe(
