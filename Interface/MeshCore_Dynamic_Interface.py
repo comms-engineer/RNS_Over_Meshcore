@@ -997,7 +997,7 @@ class MeshCore_Dynamic_Interface(Interface):
 
         if rns_idx != -1:
             sender = text[:rns_idx].rstrip(": ") if rns_idx > 0 else ""
-            await self._process_tunnel_text(text[rns_idx:], sender)
+            await self._process_tunnel_text(text[rns_idx:], sender, rx_mode="CHANNEL")
 
     async def _on_direct_msg(self, event):
         """Handles incoming unicast direct messages from known MeshCore peers."""
@@ -1010,7 +1010,7 @@ class MeshCore_Dynamic_Interface(Interface):
         if not text.startswith(self.MSG_PREFIX):
             return
         sender_id = self._resolve_sender_key(sender_key)
-        await self._process_tunnel_text(text, sender_id)
+        await self._process_tunnel_text(text, sender_id, rx_mode="DIRECT")
 
     async def _on_msg_ack(self, event):
         """ACK receipt hook — reserved for future retry/reliability tracking."""
@@ -1102,7 +1102,7 @@ class MeshCore_Dynamic_Interface(Interface):
                     return stored_name
         return key_str
 
-    async def _process_tunnel_text(self, text: str, sender: str = ""):
+    async def _process_tunnel_text(self, text: str, sender: str = "", rx_mode: str = "UNKNOWN"):
         """
         Decode a base64-encoded fragment and reassemble into a full RNS packet.
 
@@ -1214,7 +1214,21 @@ class MeshCore_Dynamic_Interface(Interface):
                                 f"-> '{sender}'",
                                 RNS.LOG_DEBUG
                             )
-
+        if full_packet:
+            # Extract RNS packet type (bits 1-0 of the header byte)
+            ptype = full_packet[0] & 0x03
+            ptype_str = {
+                0x00: "DATA", 
+                0x01: "ANNOUNCE", 
+                0x02: "LINK_REQ", 
+                0x03: "PROOF"
+            }.get(ptype, "UNKNOWN")
+            
+            RNS.log(
+                f"MeshCore_Dynamic_Interface [{self.name}]: "
+                f"RX -> {rx_mode} from '{sender}'. Reassembled {len(full_packet)}b {ptype_str} packet.",
+                RNS.LOG_INFO
+            )
         try:
             self.processIncoming(full_packet)
         except Exception as exc:
