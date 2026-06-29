@@ -1386,6 +1386,11 @@ class MeshCore_Dynamic_Interface(Interface):
                 else:
                     await self._mc.commands.send_chan_msg(self.channel_idx, frag_str)
             except Exception:
+                if mode == "direct":
+                    try:
+                        self._outqueue.put_nowait(("channel", None, frag_str))
+                    except asyncio.QueueFull:
+                        pass
                 self._outqueue.task_done()
                 continue
 
