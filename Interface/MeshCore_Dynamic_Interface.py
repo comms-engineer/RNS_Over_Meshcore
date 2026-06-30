@@ -1484,7 +1484,7 @@ class MeshCore_Dynamic_Interface(Interface):
     def process_outgoing(self, data):
         """Compatibility shim — RNS may call either spelling."""
         return self.processOutgoing(data)
-
+    
     def processOutgoing(self, data):
         """
         Fragment and enqueue an outbound RNS packet.
@@ -1568,6 +1568,9 @@ class MeshCore_Dynamic_Interface(Interface):
 
         handler   = _PacketHandler(data, pkt_id, self.payload_size)
         broadcast = self._is_broadcast_packet(data)
+        
+        # Identify path requests explicitly (DATA + PLAIN destination format)
+        is_path_req = (ptype == self._RNS_PTYPE_DATA and dest_type == self._RNS_DTYPE_PLAIN)
 
         # Resolve a unicast next-hop from the cached RNS→MC route map.
         target_key = None
@@ -1575,20 +1578,18 @@ class MeshCore_Dynamic_Interface(Interface):
 
         if broadcast:
             channel_reason = "Mandatory broadcast packet (e.g., Announce)"
+        elif is_path_req:
+            # ROOT CAUSE FIX: Forcing path requests to bypass the unicast map lookup entirely.
+            # Discovery signals must be omnidirectional; checking the stale cache here traps them.
+            channel_reason = "Network discovery frame (Path Request) - bypassing unicast map"
         elif not self._has_direct_api:
             channel_reason = "Direct routing API disabled or undetected by interface"
         elif len(data) < 11:
             channel_reason = f"Packet too short to extract origin token (len: {len(data)})"
         else:
             # [FIX 2] Fixed, unconditional token window — bytes[1:11].
-            # Previously this branched on header bit 6 and on whether the
-            # first extracted byte was 0x00, shifting the window by one byte
-            # in either case. Neither shift corresponded to anything written
-            # on the inbound learning side (_process_tunnel_text always uses
-            # full_packet[1:11]), so any packet that tripped either condition
-            # was guaranteed to miss the route map even when a valid direct
-            # route existed. See module docstring RNS TOKEN WINDOW note.
-            next_hop_token = self._extract_rns_token(dat)
+            # Typro Correction: Changed variable 'dat' to 'data' to resolve runtime NameError.
+            next_hop_token = self._extract_rns_token(data)
 
             if not next_hop_token:
                 channel_reason = "Packet too short for RNS token extraction"
@@ -1597,11 +1598,11 @@ class MeshCore_Dynamic_Interface(Interface):
                     target_key = self._rns_to_mc_map.get(next_hop_token)
                     resolved_pending_name = None
                     if not target_key:
-                    # [FIX 1] Retroactive resolution: this token may have
-                    # been learned from a packet that arrived before RNSBIND
-                    # completed for its sender. Check the pending map and, if
-                    # the peer's MeshCore key is now known, resolve and
-                    # promote it on the spot.
+                        # [FIX 1] Retroactive resolution: this token may have
+                        # been learned from a packet that arrived before RNSBIND
+                        # completed for its sender. Check the pending map and, if
+                        # the peer's MeshCore key is now known, resolve and
+                        # promote it on the spot.
                         pending_name = self._rns_to_sender_map.get(next_hop_token)
                         if pending_name:
                             candidate_key = self._peer_table.get(pending_name)
