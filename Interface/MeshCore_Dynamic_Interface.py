@@ -1584,7 +1584,10 @@ class MeshCore_Dynamic_Interface(Interface):
             # Discovery signals must remain omnidirectional to traverse mesh topology
             channel_reason = "Network discovery frame (Path Request) - bypassing unicast map"
         elif is_link_req and self._peer_table:
-            target_key = list(self._peer_table.values())[0]
+            if next_hop_token in self._rns_to_mc_map:
+                target_key = self._rns_to_mc_map[next_hop_token]
+            else
+                channel_reason = "Standard RNS link establishment"
         elif not self._has_direct_api:
             channel_reason = "Direct routing API disabled or undetected by interface"
         elif len(data) < 11:
