@@ -1450,10 +1450,11 @@ class MeshCore_Dynamic_Interface(Interface):
         # Reticulum Wire Protocol Spec: LINK destination type is binary 11 (0x03)
         if dest_type == 0x03: 
             # Safely slice the 10-byte Link ID
-            return data[2:12] if len(data) >= 12 else data[2:]
+            return data[2:12] if len(data) >= 12 else b""
         else:
-            # Safely slice the 16-byte Destination Hash
-            return data[2:18] if len(data) >= 18 else data[2:]
+            # Fallback to the fixed, unconditional 10-byte compact RNS token window
+            # used on the outbound lookup path (processOutgoing)
+            return data[1:11] if len(data) >= 11 else b""
   
     # -------------------------------------------------------------------------
     # Outbound
