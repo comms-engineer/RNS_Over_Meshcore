@@ -1572,6 +1572,8 @@ class MeshCore_Dynamic_Interface(Interface):
         # Identify explicit network path discovery frames
         is_path_req = (ptype == self._RNS_PTYPE_DATA and dest_type == self._RNS_DTYPE_PLAIN)
 
+        is_link_req = (ptype == self._RNS_PTYPE_LINK)
+      
         # Resolve a unicast next-hop from the cached RNS→MC route map.
         target_key = None
         channel_reason = ""
@@ -1581,6 +1583,8 @@ class MeshCore_Dynamic_Interface(Interface):
         elif is_path_req:
             # Discovery signals must remain omnidirectional to traverse mesh topology
             channel_reason = "Network discovery frame (Path Request) - bypassing unicast map"
+        elif is_link_req and self._peer_table:
+            target_key = list(self._peer_table.values())[0]
         elif not self._has_direct_api:
             channel_reason = "Direct routing API disabled or undetected by interface"
         elif len(data) < 11:
