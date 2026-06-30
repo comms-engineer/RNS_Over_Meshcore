@@ -1437,24 +1437,54 @@ class MeshCore_Dynamic_Interface(Interface):
     def _extract_rns_token(self, data: bytes) -> bytes:
         """
         Dynamically extracts the RNS destination token based on Reticulum's
-        header type framing rules. Correctly isolates the 10-byte Link ID for 
-        LINK destinations (0x03), falling back to the 16-byte destination 
-        hash for SINGLE, GROUP, and PLAIN packets.
+        header type framing rules, accounting for IFAC variations and 
+        Header Type 1 vs Header Type 2 address spacing.
         """
-        if len(data) < 3:
+        if len(data) < 2:
             return b""
 
-        # Extract destination type from bits 3-2 of the first header byte
-        dest_type = (data[0] >> 2) & 0x03
+        header_0 = data[0]
+        
+        # 1. Handle Variable-Length IFAC if enabled (Bit 7)
+        # Note: If your physical/virtual layer uses an IFAC, adjust self.IFAC_SIZE 
+        # to match your configuration (typically 0 if managed at L2).
+        ifac_present = (header_0 >> 7) & 0x01
+        ifac_offset = self.IFAC_SIZE if (ifac_present and hasattr(self, 'IFAC_SIZE')) else 0
+        
+        # Base offset where the address tracking fields actually begin
+        base_offset = 2 + ifac_offset
+        if len(data) < base_offset:
+            return b""
+
+        # 2. Extract Destination Type (Bits 3-2) & Packet Type (Bits 1-0)
+        dest_type = (header_0 >> 2) & 0x03
+        pkt_type  = header_0 & 0x03
 
         # Reticulum Wire Protocol Spec: LINK destination type is binary 11 (0x03)
         if dest_type == 0x03: 
-            # Safely slice the 10-byte Link ID
-            return data[2:12] if len(data) >= 12 else b""
+            # Safely slice the 10-byte Link ID directly after the 2-byte header
+            return data[base_offset : base_offset + 10] if len(data) >= (base_offset + 10) else b""
+
+        # 3. Handle Header Type 1 vs Header Type 2 (Bit 4)
+        header_type = (header_0 >> 4) & 0x01
+
+        if header_type == 1:
+            # Header Type 2: [16-byte SENDER HASH] [16-byte DESTINATION HASH]
+            # Destination hash starts at base_offset + 16
+            dest_hash_start = base_offset + 16
         else:
-            # Fallback to the fixed, unconditional 10-byte compact RNS token window
-            # used on the outbound lookup path (processOutgoing)
-            return data[1:11] if len(data) >= 11 else b""
+            # Header Type 1: [16-byte DESTINATION HASH]
+            dest_hash_start = base_offset
+
+        if len(data) < (dest_hash_start + 16):
+            return b""
+
+        # Extract the real destination hash
+        dest_hash = data[dest_hash_start : dest_hash_start + 16]
+
+        # Return the 10-byte compact window representation to maintain 
+        # symmetry with your outbound routing map lookup keys.
+        return dest_hash[:10]
   
     # -------------------------------------------------------------------------
     # Outbound
@@ -1511,10 +1541,8 @@ class MeshCore_Dynamic_Interface(Interface):
         Broadcast packets (announces, link requests) always go to the shared
         channel.  For all other traffic:
 
-          1. The RNS token (bytes 1:11 — see [FIX 2] and the module docstring's
-             RNS TOKEN WINDOW note; this is now an UNCONDITIONAL, fixed window
-             with no header-flag-dependent shifting) is looked up directly in
-             _rns_to_mc_map. If found, the packet goes direct immediately.
+          1. The RNS token is looked up directly in _rns_to_mc_map. 
+             If found, the packet goes direct immediately.
 
           2. [FIX 1] If not found in the fast-path map, the token is checked
              against _rns_to_sender_map (tokens learned before the owning
@@ -1587,9 +1615,18 @@ class MeshCore_Dynamic_Interface(Interface):
         elif len(data) < 11:
             channel_reason = f"Packet too short to extract origin token (len: {len(data)})"
         else:
-            # [FIX 2] Fixed, unconditional token window — bytes[1:11].
-            # Fixed runtime NameError by replacing 'dat' reference with 'data'.
-            next_hop_token = self._extract_rns_token(data)
+            # -------------------------------------------------------------
+            # OUTBOUND TOKEN EXTRACTION
+            # For outbound packets, the destination next-hop token is ALWAYS
+            # derived from Address 1 (the Destination Hash), regardless of whether
+            # it is a Header Type 1 or Header Type 2 packet.
+            # -------------------------------------------------------------
+            if dest_type == self._RNS_DTYPE_LINK:
+                # Reticulum Wire Protocol Spec: LINK ID occupies bytes 2:12
+                next_hop_token = data[2:12] if len(data) >= 12 else b""
+            else:
+                # Standard packet destination: Hops byte (data[1]) + first 9 bytes of Destination Address
+                next_hop_token = data[1:11] if len(data) >= 11 else b""
 
             if not next_hop_token:
                 channel_reason = "Packet too short for RNS token extraction"
@@ -1649,7 +1686,7 @@ class MeshCore_Dynamic_Interface(Interface):
         else:
             RNS.log(
                 f"MeshCore_Dynamic_Interface [{self.name}]: "
-                f"Routing -> DIRECT via peer key {target_key[:12]}...",
+                f"Routing -> DIRECT via peer key {target_key[:12].hex() if isinstance(target_key, bytes) else target_key}...",
                 RNS.LOG_INFO
             )
             route = [("direct", target_key)]
