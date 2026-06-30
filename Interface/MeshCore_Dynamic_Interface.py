@@ -1569,7 +1569,7 @@ class MeshCore_Dynamic_Interface(Interface):
         handler   = _PacketHandler(data, pkt_id, self.payload_size)
         broadcast = self._is_broadcast_packet(data)
         
-        # Identify path requests explicitly (DATA + PLAIN destination format)
+        # Identify explicit network path discovery frames
         is_path_req = (ptype == self._RNS_PTYPE_DATA and dest_type == self._RNS_DTYPE_PLAIN)
 
         # Resolve a unicast next-hop from the cached RNS→MC route map.
@@ -1579,8 +1579,7 @@ class MeshCore_Dynamic_Interface(Interface):
         if broadcast:
             channel_reason = "Mandatory broadcast packet (e.g., Announce)"
         elif is_path_req:
-            # ROOT CAUSE FIX: Forcing path requests to bypass the unicast map lookup entirely.
-            # Discovery signals must be omnidirectional; checking the stale cache here traps them.
+            # Discovery signals must remain omnidirectional to traverse mesh topology
             channel_reason = "Network discovery frame (Path Request) - bypassing unicast map"
         elif not self._has_direct_api:
             channel_reason = "Direct routing API disabled or undetected by interface"
@@ -1588,41 +1587,55 @@ class MeshCore_Dynamic_Interface(Interface):
             channel_reason = f"Packet too short to extract origin token (len: {len(data)})"
         else:
             # [FIX 2] Fixed, unconditional token window — bytes[1:11].
-            # Typro Correction: Changed variable 'dat' to 'data' to resolve runtime NameError.
+            # Fixed runtime NameError by replacing 'dat' reference with 'data'.
             next_hop_token = self._extract_rns_token(data)
 
             if not next_hop_token:
                 channel_reason = "Packet too short for RNS token extraction"
             else:
+                # -------------------------------------------------------------
+                # DYNAMIC LINK TARGET RESOLUTION
+                # If this payload is traveling over an established RNS link, the 
+                # next_hop_token is a 10-byte truncated Link ID. We must query
+                # Reticulum's global Transport table to find the actual target
+                # identity hash associated with this specific connection session.
+                # -------------------------------------------------------------
+                lookup_token = next_hop_token
+                if dest_type == self._RNS_DTYPE_LINK:
+                    for link in getattr(RNS.Transport, "links", []):
+                        if getattr(link, "link_id", b"")[:10] == next_hop_token:
+                            if getattr(link, "type", None) == RNS.Link.OUT:
+                                lookup_token = link.destination.hash
+                            elif getattr(link, "type", None) == RNS.Link.IN and getattr(link, "remote_identity", None):
+                                lookup_token = link.remote_identity.hash
+                            break
+
                 with self._peer_lock:
-                    target_key = self._rns_to_mc_map.get(next_hop_token)
+                    target_key = self._rns_to_mc_map.get(lookup_token)
                     resolved_pending_name = None
                     if not target_key:
-                        # [FIX 1] Retroactive resolution: this token may have
-                        # been learned from a packet that arrived before RNSBIND
-                        # completed for its sender. Check the pending map and, if
-                        # the peer's MeshCore key is now known, resolve and
-                        # promote it on the spot.
-                        pending_name = self._rns_to_sender_map.get(next_hop_token)
+                        # [FIX 1] Retroactive resolution: check the pending map
+                        # for users whose identity was confirmed post-announcement.
+                        pending_name = self._rns_to_sender_map.get(lookup_token)
                         if pending_name:
                             candidate_key = self._peer_table.get(pending_name)
                             if candidate_key:
                                 target_key = candidate_key
-                                self._rns_to_mc_map[next_hop_token] = candidate_key
-                                del self._rns_to_sender_map[next_hop_token]
+                                self._rns_to_mc_map[lookup_token] = candidate_key
+                                del self._rns_to_sender_map[lookup_token]
                                 resolved_pending_name = pending_name
 
             if resolved_pending_name:
                 RNS.log(
                     f"MeshCore_Dynamic_Interface [{self.name}]: "
                     f"Retroactively resolved direct route for token "
-                    f"{next_hop_token.hex()[:8]} -> '{resolved_pending_name}' "
+                    f"{lookup_token.hex()[:8]} -> '{resolved_pending_name}' "
                     f"(RNSBIND has since completed for this peer).",
                     RNS.LOG_INFO
                 )
 
             if not target_key:
-                channel_reason = f"No direct route bound for RNS token {next_hop_token.hex()[:8]}"
+                channel_reason = f"No direct route bound for RNS token {lookup_token.hex()[:8]}"
 
         # Apply routing decision and log the result
         if channel_reason:
