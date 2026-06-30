@@ -1346,7 +1346,16 @@ class MeshCore_Dynamic_Interface(Interface):
         elif len(data) < 11:
             channel_reason = f"Packet too short to extract origin token (len: {len(data)})"
         else:
-            next_hop_token = bytes(data[1:11])
+            header_byte = data[0]
+            offset = 1
+            if (header_byte & 0x40):
+                offset += 1
+            
+            next_hop_token = bytes(data[offset:offset+10])
+
+            if next_hop_token[0] == 0x00 and len(data) > offset + 10:
+                next_hop_token = bytes(data[offset+1:offset+11])
+            
             with self._peer_lock:
                 target_key = self._rns_to_mc_map.get(next_hop_token)
             if not target_key:
