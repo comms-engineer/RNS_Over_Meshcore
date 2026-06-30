@@ -1436,55 +1436,26 @@ class MeshCore_Dynamic_Interface(Interface):
 
     def _extract_rns_token(self, data: bytes) -> bytes:
         """
-        Dynamically extracts the RNS destination token based on Reticulum's
-        header type framing rules, accounting for IFAC variations and 
-        Header Type 1 vs Header Type 2 address spacing.
+        Dynamically extracts an invariant 10-byte RNS address token.
+        Excludes the volatile network hops byte (data[1]) to ensure tracking
+        remains stable across multi-hop transport boundaries.
         """
-        if len(data) < 2:
+        if len(data) < 3:
             return b""
 
-        header_0 = data[0]
-        
-        # 1. Handle Variable-Length IFAC if enabled (Bit 7)
-        # Note: If your physical/virtual layer uses an IFAC, adjust self.IFAC_SIZE 
-        # to match your configuration (typically 0 if managed at L2).
-        ifac_present = (header_0 >> 7) & 0x01
-        ifac_offset = self.IFAC_SIZE if (ifac_present and hasattr(self, 'IFAC_SIZE')) else 0
-        
-        # Base offset where the address tracking fields actually begin
-        base_offset = 2 + ifac_offset
-        if len(data) < base_offset:
-            return b""
+        header_type = (data[0] >> 6) & 0x01
+        dest_type = (data[0] >> 2) & 0x03
 
-        # 2. Extract Destination Type (Bits 3-2) & Packet Type (Bits 1-0)
-        dest_type = (header_0 >> 2) & 0x03
-        pkt_type  = header_0 & 0x03
-
-        # Reticulum Wire Protocol Spec: LINK destination type is binary 11 (0x03)
+        # LINK Packets: Extract 10-byte Link ID
         if dest_type == 0x03: 
-            # Safely slice the 10-byte Link ID directly after the 2-byte header
-            return data[base_offset : base_offset + 10] if len(data) >= (base_offset + 10) else b""
-
-        # 3. Handle Header Type 1 vs Header Type 2 (Bit 4)
-        header_type = (header_0 >> 4) & 0x01
-
+            return data[2:12] if len(data) >= 12 else b""
+        
+        # Header Type 2: Inbound multi-hop frame. Isolate 10 bytes of Peer Source Hash
         if header_type == 1:
-            # Header Type 2: [16-byte SENDER HASH] [16-byte DESTINATION HASH]
-            # Destination hash starts at base_offset + 16
-            dest_hash_start = base_offset + 16
-        else:
-            # Header Type 1: [16-byte DESTINATION HASH]
-            dest_hash_start = base_offset
-
-        if len(data) < (dest_hash_start + 16):
-            return b""
-
-        # Extract the real destination hash
-        dest_hash = data[dest_hash_start : dest_hash_start + 16]
-
-        # Return the 10-byte compact window representation to maintain 
-        # symmetry with your outbound routing map lookup keys.
-        return dest_hash[:10]
+            return data[18:28] if len(data) >= 28 else b""
+        
+        # Header Type 1: Single address frame. Isolate 10 bytes of Destination Hash
+        return data[2:12] if len(data) >= 12 else b""
   
     # -------------------------------------------------------------------------
     # Outbound
@@ -1626,7 +1597,7 @@ class MeshCore_Dynamic_Interface(Interface):
                 next_hop_token = data[2:12] if len(data) >= 12 else b""
             else:
                 # Standard packet destination: Hops byte (data[1]) + first 9 bytes of Destination Address
-                next_hop_token = data[1:11] if len(data) >= 11 else b""
+                next_hop_token = data[2:12] if len(data) >= 12 else b""
 
             if not next_hop_token:
                 channel_reason = "Packet too short for RNS token extraction"
