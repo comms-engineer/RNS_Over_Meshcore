@@ -1436,24 +1436,22 @@ class MeshCore_Dynamic_Interface(Interface):
 
     def _extract_rns_token(self, data: bytes) -> bytes:
         """
-        Dynamically extracts the 10-byte RNS destination token based on 
-        Reticulum's header type framing rules, isolating the destination hash 
-        from variable-length transport overhead.
+        Dynamically extracts the RNS destination token based on Reticulum's 
+        header type framing rules, isolating the destination hash from 
+        variable-length transport overhead by clearing the 2-byte base header.
         """
-        if len(data) < 2:
+        if len(data) < 3:
             return b""
-            
-        header_byte = data[0]
-        header_type = (header_byte & 0xC0) >> 6
-        
-        # header_type 0b00 = HEADER_1 (1-byte header, hash starts at index 1)
-        # header_type 0b01, 0b10, 0b11 = HEADER_2 (2-byte header, hash starts at index 2)
-        start_idx = 1 if header_type == 0 else 2
-        end_idx = start_idx + 10
-        
-        if len(data) >= end_idx:
-            return bytes(data[start_idx:end_idx])
-        return b""
+
+        # Extract destination type from bits 3-2 of the first header byte
+        dest_type = (data[0] >> 2) & 0x03
+
+        if dest_type == 0x01:  # RNS_DTYPE_LINK
+            # Truncated 10-byte Link ID on the wire
+            return data[2:12]
+        else:
+            # Full 16-byte Destination Hash (SINGLE, GROUP, PLAIN)
+            return data[2:18]
   
     # -------------------------------------------------------------------------
     # Outbound
