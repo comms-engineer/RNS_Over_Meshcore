@@ -1367,8 +1367,8 @@ class MeshCore_Dynamic_Interface(Interface):
         # Dynamic L2/L3 link learning: index bytes 1:11 of the reassembled
         # packet (RNS origin token) against the MeshCore sender key so that
         # future outbound packets for this destination can be sent unicast.
-        if len(full_packet) >= 11 and sender:
-            rns_token = bytes(full_packet[1:11])
+        rns_token = self._extract_rns_token(full_packet)
+        if rns_token and sender:
             with self._peer_lock:
                 mc_key = self._peer_table.get(sender)
                 if mc_key:
@@ -1434,6 +1434,27 @@ class MeshCore_Dynamic_Interface(Interface):
                 f"Delivery error: {exc}", RNS.LOG_ERROR
             )
 
+    def _extract_rns_token(self, data: bytes) -> bytes:
+        """
+        Dynamically extracts the 10-byte RNS destination token based on 
+        Reticulum's header type framing rules, isolating the destination hash 
+        from variable-length transport overhead.
+        """
+        if len(data) < 2:
+            return b""
+            
+        header_byte = data[0]
+        header_type = (header_byte & 0xC0) >> 6
+        
+        # header_type 0b00 = HEADER_1 (1-byte header, hash starts at index 1)
+        # header_type 0b01, 0b10, 0b11 = HEADER_2 (2-byte header, hash starts at index 2)
+        start_idx = 1 if header_type == 0 else 2
+        end_idx = start_idx + 10
+        
+        if len(data) >= end_idx:
+            return bytes(data[start_idx:end_idx])
+        return b""
+  
     # -------------------------------------------------------------------------
     # Outbound
     # -------------------------------------------------------------------------
@@ -1567,25 +1588,28 @@ class MeshCore_Dynamic_Interface(Interface):
             # full_packet[1:11]), so any packet that tripped either condition
             # was guaranteed to miss the route map even when a valid direct
             # route existed. See module docstring RNS TOKEN WINDOW note.
-            next_hop_token = bytes(data[1:11])
+            next_hop_token = self._extract_rns_token(dat)
 
-            with self._peer_lock:
-                target_key = self._rns_to_mc_map.get(next_hop_token)
-                resolved_pending_name = None
-                if not target_key:
+            if not next_hop_token:
+                channel_reason = "Packet too short for RNS token extraction"
+            else:
+                with self._peer_lock:
+                    target_key = self._rns_to_mc_map.get(next_hop_token)
+                    resolved_pending_name = None
+                    if not target_key:
                     # [FIX 1] Retroactive resolution: this token may have
                     # been learned from a packet that arrived before RNSBIND
                     # completed for its sender. Check the pending map and, if
                     # the peer's MeshCore key is now known, resolve and
                     # promote it on the spot.
-                    pending_name = self._rns_to_sender_map.get(next_hop_token)
-                    if pending_name:
-                        candidate_key = self._peer_table.get(pending_name)
-                        if candidate_key:
-                            target_key = candidate_key
-                            self._rns_to_mc_map[next_hop_token] = candidate_key
-                            del self._rns_to_sender_map[next_hop_token]
-                            resolved_pending_name = pending_name
+                        pending_name = self._rns_to_sender_map.get(next_hop_token)
+                        if pending_name:
+                            candidate_key = self._peer_table.get(pending_name)
+                            if candidate_key:
+                                target_key = candidate_key
+                                self._rns_to_mc_map[next_hop_token] = candidate_key
+                                del self._rns_to_sender_map[next_hop_token]
+                                resolved_pending_name = pending_name
 
             if resolved_pending_name:
                 RNS.log(
