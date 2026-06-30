@@ -1359,6 +1359,25 @@ class MeshCore_Dynamic_Interface(Interface):
             with self._peer_lock:
                 target_key = self._rns_to_mc_map.get(next_hop_token)
             if not target_key:
+                # If the token is a Link ID, resolve it via Reticulum's Transport layer
+                import RNS
+                    active_link = next(
+                        (l for l in RNS.Transport.links
+                         if hasattr(l, 'link_id') and l.link_id == next_hop_token
+                         and getattr(l, 'destination', None) is not None
+                         and getattr(l.destination, 'hash', None) is not None),
+                        None
+                    )
+                if active_link and active_link.destination:
+                    node_hash = active_link.destination.hash
+                    with self._peer_lock:
+                        target_key = self._rns_to_mc_map.get(node_hash)
+                        if target_key:
+                            # Proactively bind this ephemeral Link ID to the known peer
+                            self._rns_to_mc_map[next_hop_token] = target_key
+                            RNS.log(f"MeshCore: Resolved Link ID {next_hop_token.hex()[:8]} -> Node {node_hash.hex()[:8]} ({target_key})", RNS.LOG_DEBUG)
+            
+            if not target_key:
                 channel_reason = f"No direct route bound for RNS token {next_hop_token.hex()[:8]}"
 
         # Apply routing decision and log the result
