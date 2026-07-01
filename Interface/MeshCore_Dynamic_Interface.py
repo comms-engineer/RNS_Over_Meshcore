@@ -537,6 +537,20 @@ class MeshCore_Dynamic_Interface(Interface):
 
         if self.allow_direct:
             self._has_direct_api = hasattr(self._mc.commands, "send_msg")
+            if self._has_direct_api:
+                # Keep the local contact cache (self._mc.contacts) populated and
+                # current -- this rides the same connection rnsd already owns,
+                # it's not a second client. auto_update_contacts re-fetches
+                # automatically whenever the firmware reports a path change,
+                # so out_path_len is always fresh when we need to log it.
+                try:
+                    self._mc.auto_update_contacts = True
+                    await self._mc.ensure_contacts()
+                except Exception as exc:
+                    RNS.log(
+                        f"MeshCore_Dynamic_Interface [{self.name}]: "
+                        f"Initial contact fetch failed: {exc}", RNS.LOG_DEBUG
+                    )
 
         self._mc.subscribe(
             ET.CHANNEL_MSG_RECV,
@@ -995,7 +1009,7 @@ class MeshCore_Dynamic_Interface(Interface):
 
     def process_outgoing(self, data):
         return self.processOutgoing(data)
-    
+
     def processOutgoing(self, data):
         if not self.online:
             return
@@ -1026,7 +1040,7 @@ class MeshCore_Dynamic_Interface(Interface):
 
         with self._pkt_id_lock:
             pkt_id       = self._pkt_id
-            self._pkt_id = (self._pkt_id + 1) & 0xFFFFFFFF  
+            self._pkt_id = (self._pkt_id + 1) & 0xFFFFFFFF  # 32-bit bound integer tracking
 
         handler   = _PacketHandler(data, pkt_id, self.payload_size)
         broadcast = self._is_broadcast_packet(data)
@@ -1054,88 +1068,100 @@ class MeshCore_Dynamic_Interface(Interface):
                 f"Routing -> CHANNEL. Reason: {channel_reason}",
                 RNS.LOG_INFO
             )
-            mode, target = "channel", None
+            route = [("channel", None)]
         else:
             RNS.log(
                 f"MeshCore_Dynamic_Interface [{self.name}]: "
                 f"Routing -> DIRECT via peer key {target_key[:12]}...",
                 RNS.LOG_INFO
             )
-            mode, target = "direct", target_key
+            route = [("direct", target_key)]
             
-        try:
-            # Enqueue the ENTIRE list of fragments as a single atomic transaction
-            self._outqueue.put((mode, target, handler.fragments), block=True, timeout=None)
-        except Exception as exc:
-            RNS.log(f"MeshCore_Dynamic_Interface [{self.name}]: Queue write failed: {exc}", RNS.LOG_ERROR)
+        for frag_str in handler.fragments:
+            for mode, target in route:
+                try:
+                    # Thread-safe blocking put handles backpressure cleanly
+                    self._outqueue.put((mode, target, frag_str), block=True, timeout=None)
+                except Exception:
+                    pass
 
         self.txb += len(data)
 
     async def _async_outgoing_worker(self):
         """
-        Worker task pulling atomic fragment trains from the synchronized queue.
-        Dispatches sub-fragments with minimal hardware pacing, then enforces
-        macro-delays between complete RNS packets.
+        Worker task pulling payload chunks from the thread-safe synchronized queue
+        using the event loop executor pool to preserve pure async interface execution.
         """
         while True:
             if not self.online or self._mc is None:
                 await asyncio.sleep(0.5)
                 continue
 
-            # Extract the atomic item (contains the full list of fragments)
+            # Safe non-blocking cross-thread extraction via run_in_executor
             item = await self._loop.run_in_executor(None, self._outqueue.get)
-            mode, target, fragments = item
+            mode, target, frag_str = item
 
-            packet_failed = False
-            total_chars_sent = 0
-
-            for idx, frag_str in enumerate(fragments):
-                try:
-                    if mode == "direct":
-                        await self._mc.commands.send_msg(target, frag_str)
-                    else:
-                        await self._mc.commands.send_chan_msg(self.channel_idx, frag_str)
-                    
-                    total_chars_sent += len(frag_str)
-                except Exception as exc:
+            try:
+                if mode == "direct":
+                    result = await self._mc.commands.send_msg(target, frag_str)
+                    # send_msg() does not raise on a failed/pathless delivery -- it
+                    # returns an Event whose .type may be ERROR (e.g. no known
+                    # out_path to this contact yet). A bare await here treats that
+                    # ERROR event as success, silently dropping the fragment.
+                    # FIX: explicitly check the returned event and treat non-MSG_SENT
+                    # as a failure so it falls through to the same except-block
+                    # fallback used for real exceptions.
+                    if result is None or result.type != self._EventType.MSG_SENT:
+                        reason = (
+                            result.payload.get("reason", "no path/unknown")
+                            if result is not None else "no response"
+                        )
+                        raise RuntimeError(f"direct send not confirmed: {reason}")
+                else:
+                    await self._mc.commands.send_chan_msg(self.channel_idx, frag_str)
+            except Exception as exc:
+                if mode == "direct":
+                    # Diagnostic: pull the target's out_path status from the
+                    # meshcore library's local contact cache (self._mc.contacts).
+                    # This reads in-memory state populated by earlier
+                    # CONTACTS/PATH_UPDATE/ADVERTISEMENT events -- it does NOT
+                    # touch the serial port, so it's safe to call from here
+                    # without contending with rnsd's own use of the connection.
+                    path_info = "unknown (no cached contact)"
+                    try:
+                        contact = self._mc.get_contact_by_key_prefix(target) if target else None
+                        if contact:
+                            opl = contact.get("out_path_len", -1)
+                            path_info = (
+                                f"out_path_len={opl}"
+                                if opl != -1 else "out_path_len=-1 (no known route)"
+                            )
+                    except Exception:
+                        pass
                     RNS.log(
                         f"MeshCore_Dynamic_Interface [{self.name}]: "
-                        f"TX failed during fragment {idx+1}/{len(fragments)}: {exc}", 
-                        RNS.LOG_WARNING
+                        f"DIRECT send to peer key {target[:12] if target else '?'}... "
+                        f"failed ({exc}) [{path_info}] -- falling back to CHANNEL.",
+                        RNS.LOG_DEBUG
                     )
-                    if mode == "direct":
-                        packet_failed = True
-                    break
-                
-                # Pacing delay INSIDE a single RNS packet burst
-                # Just enough to clear the local UART/firmware buffer without triggering duty-cycle drops
-                if idx < len(fragments) - 1:
-                    intra_delay = 0.05 if mode == "direct" else 0.25
-                    await asyncio.sleep(intra_delay)
-
-            # Fallback handling if a directed route link drops mid-burst
-            if packet_failed:
-                RNS.log(f"MeshCore_Dynamic_Interface [{self.name}]: Direct burst failed. Falling back to channel routing.", RNS.LOG_WARNING)
-                try:
-                    self._outqueue.put_nowait(("channel", None, fragments))
-                except queue.Full:
-                    RNS.log(f"MeshCore_Dynamic_Interface [{self.name}]: Queue full, dropping fallback packet.", RNS.LOG_ERROR)
+                    try:
+                        # Fallback to channel if targeted routing exceptions happen mid-transit
+                        self._outqueue.put_nowait(("channel", None, frag_str))
+                    except queue.Full:
+                        pass
                 self._outqueue.task_done()
                 continue
 
-            # Macro-delay applied AFTER the entire fragment train has cleared the interface
-            macro_delay = (
+            delay = (
                 self.direct_frag_delay_s
                 if mode == "direct"
                 else self.fragment_delay_s
             )
-            
-            if self.rate_limit_bps > 0 and total_chars_sent > 0:
-                # Calculate bit overhead from the base64 character footprint
-                bits  = (total_chars_sent * 3 // 4) * 8
-                macro_delay = max(macro_delay, bits / self.rate_limit_bps)
+            if self.rate_limit_bps > 0:
+                bits  = (len(frag_str) * 3 // 4) * 8
+                delay = max(delay, bits / self.rate_limit_bps)
 
-            await asyncio.sleep(macro_delay)
+            await asyncio.sleep(delay)
             self._outqueue.task_done()
 
     # -------------------------------------------------------------------------
