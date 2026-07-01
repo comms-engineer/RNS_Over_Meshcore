@@ -1,319 +1,228 @@
-# MeshCore Dynamic Interface for Reticulum
+# MeshCore Dynamic Interface
 
-A [Reticulum](https://reticulum.network) interface driver that tunnels RNS traffic over a [MeshCore](https://github.com/ripplebiz/MeshCore) LoRa mesh radio network.
+A [Reticulum Network Stack (RNS)](https://reticulum.network/) custom interface that tunnels RNS traffic over a [MeshCore](https://meshcore.co.uk/) LoRa mesh. It requires no static remote-node configuration — peers discover each other dynamically over the air — and uses a hybrid channel-broadcast / unicast-direct routing strategy to keep airtime usage on a shared, half-duplex LoRa channel as low as possible.
 
-Supports hybrid routing: channel broadcast for path discovery and announces, unicast direct messages for established sessions. Peer discovery is demand-driven — no static node configuration is required.
+## Why this exists
 
----
+RNS ships interfaces for TCP, serial, I2P, packet radio, and a handful of others, but nothing that speaks directly to MeshCore firmware. This interface fills that gap: it fragments and re-assembles RNS binary packets into MeshCore channel/direct messages, and layers a lightweight peer-discovery and routing protocol on top so that Reticulum can run natively over a MeshCore LoRa network — including in mixed deployments where a MeshCore mesh acts as the "last mile" for an existing RNS transport backbone.
 
 ## Features
 
-- **Three transport backends** — serial, TCP, and BLE connections to a MeshCore node
-- **Automatic peer discovery** via a pull-based RNSBIND protocol; no address lists to maintain
-- **Hybrid routing** — broadcasts where necessary, switches to firmware-ACK'd unicast direct messages once a path is established
-- **Edge node capability advertisement** — nodes with no upstream connectivity declare themselves at discovery time so peers do not attempt to route transit traffic through them
-- **Downstream client support** — edge nodes can serve phones and laptops behind a hotspot while still participating fully in the mesh
-- **Announce and path-request rate limiting** — independent per-destination throttles that operate alongside RNS's own rate caps to protect constrained LoRa channels
-- **Automatic peer expiry** — stale peer entries and associated route table entries are cleaned up on a configurable TTL
-
----
+- **Zero static config peer discovery** — nodes find each other with a demand-driven `RNSBIND_REQ` / `RNSBIND` handshake instead of periodic broadcast, based on the RFC 2236 (IGMP) report-suppression pattern to avoid response storms on a shared channel.
+- **Hybrid routing** — channel broadcast for announces/discovery, unicast direct messages for established peer-to-peer sessions, with automatic fallback from direct to channel if a unicast send fails or goes unacknowledged.
+- **RNS Link ID aware routing** — correctly follows Reticulum's ephemeral Link ID once a Link handshake completes, deriving the destination hash locally so routing doesn't break mid-session.
+- **Capability-aware discovery** — peers advertise whether they can carry transit traffic (`R` router / `E` edge) at discovery time, useful for distinguishing infrastructure nodes from battery-powered edge devices.
+- **Delivery-aware direct sends** — waits on the MeshCore firmware's `expected_ack` / `ACK` event pair for unicast messages rather than trusting the immediate `MSG_SENT` result, with a bounded timeout so a single slow/flood-mode peer can't stall the shared outgoing queue.
+- **Configurable fragmentation** — RNS packets are split into MeshCore-message-sized fragments with a compact 6-byte binary header, sized to fit under firmware channel-message character limits.
+- **Rate limiting** — independent throttles for outgoing announces, path requests, and (optionally) a hard bitrate cap, to keep the interface well-behaved on congested or bandwidth-constrained channels.
+- **Multiple transports** — connects to the MeshCore node over serial, TCP, or BLE.
 
 ## Requirements
 
-| Dependency | Version | Notes |
-|---|---|---|
-| Python | ≥ 3.8 | |
-| [Reticulum](https://github.com/markqvist/Reticulum) | ≥ 0.7.0 | `pip install rns` |
-| [meshcore-py](https://github.com/ripplebiz/meshcore-py) | latest | `pip install meshcore` |
-| MeshCore firmware | any recent | Flashed onto the LoRa radio node |
+- Python 3.9+
+- [Reticulum (`rns`)](https://pypi.org/project/rns/)
+- The [`meshcore`](https://pypi.org/project/meshcore/) Python library
+- A MeshCore-flashed radio (or a MeshCore companion app reachable over TCP/BLE) reachable from the host running `rnsd`
 
-The interface has been tested with MeshCore nodes connected over USB serial (CP210x / CH340 adapters) and over TCP via the MeshCore companion app.
-
----
+```bash
+pip install rns meshcore
+```
 
 ## Installation
 
-1. Copy `MeshCore_Dynamic_Interface.py` to your Reticulum interfaces directory.  The default path is `~/.reticulum/interfaces/`.  Create the directory if it does not exist:
-
-   ```bash
-   mkdir -p ~/.reticulum/interfaces
-   cp MeshCore_Dynamic_Interface.py ~/.reticulum/interfaces/
-   ```
-
+1. Copy `MeshCore_Dynamic_Interface.py` into your Reticulum config's `interfaces` directory (typically `~/.reticulum/interfaces/`).
 2. Add an interface block to `~/.reticulum/config` (see [Configuration](#configuration) below).
-
-3. Restart `rnsd` (or your RNS host application).
-
----
-
-## How It Works
-
-### Architecture
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│  Wider Reticulum mesh (Internet / backbone transport nodes)     │
-└────────────────────────────┬────────────────────────────────────┘
-                             │ BackboneInterface (boundary)
-                  ┌──────────▼──────────┐
-                  │   Infrastructure    │  enable_transport = yes
-                  │   (gateway) node    │  MeshCore iface: access_point
-                  │                     │  can_route = yes
-                  └──────────┬──────────┘
-                             │ MeshCore Dynamic Interface
-                             │ LoRa channel + unicast direct
-                  ┌──────────▼──────────┐
-                  │   Mobile / edge     │  enable_transport = yes
-                  │   node              │  MeshCore iface: roaming
-                  │                     │  can_route = no
-                  └──────────┬──────────┘
-                             │ TCPServerInterface / AutoInterface
-                  ┌──────────▼──────────┐
-                  │ Client devices      │  phones, laptops, tablets
-                  │ (Sideband, NomadNet,│  connected via hotspot
-                  │  any RNS client)    │
-                  └─────────────────────┘
-```
-
-Infrastructure nodes have `enable_transport = yes` and a backbone connection to the wider mesh. Mobile/edge nodes also run transport, allowing them to route between the MeshCore radio link and any downstream client devices connected to a hotspot.
-
-### Wire Format
-
-Each outgoing RNS packet is split into fragments. Each fragment is encoded as a MeshCore message:
-
-```
-"RNS:" + base64url( [frag_idx : 1 byte] [pkt_id : 1 byte] [frag_total : 1 byte] + payload )
-```
-
-No base64 padding characters are transmitted. The receiver pads and decodes each message, then reassembles fragments by `(sender, pkt_id)` key.
-
-The `payload_size` parameter controls how many raw bytes go into each fragment. A larger value means fewer fragments per packet, but MeshCore firmware silently truncates messages that exceed its internal character limit (~128 chars on common builds). The default of 64 bytes encodes to ~94 characters, which is safe even with moderately long node names prepended by the firmware.
-
-To calculate the safe limit for your specific node name length:
-
-```
-budget      = firmware_limit - len(node_name) - 2
-max_payload = floor((budget - 4) * 3/4) - 3
-```
-
-### Peer Discovery
-
-Discovery follows a pull-based protocol inspired by ARP and RFC 2236 (IGMP report suppression):
-
-1. A node with no known peers broadcasts `RNSBIND_REQ:<pubkey>:<cap>` on the shared channel.
-2. Every overhearing node records the sender immediately (passive learning), then waits a random 3–15 second backoff before responding with `RNSBIND:<pubkey>:<cap>`.
-3. The random backoff prevents a simultaneous response burst on the half-duplex LoRa channel.
-4. All nodes overhearing any `RNSBIND` response also learn the responder — a single discovery round populates every peer table on the channel.
-5. Once peers are known, a quiet hourly heartbeat maintains the tables without soliciting responses.
-
-The `<cap>` field is either `R` (routing node, has upstream connectivity) or `E` (edge node, no upstream). This is informational — it is logged and stored per peer but does not affect per-packet delivery decisions (see [Edge Nodes and Downstream Clients](#edge-nodes-and-downstream-clients)).
-
-### Routing
-
-**Outbound path selection:**
-
-```
-Is this packet a broadcast type? (ANNOUNCE or two-byte header)
-  YES → send on the shared channel
-  NO  → is there a cached unicast route in the RNS→MC map?
-          YES → send as MeshCore direct message (firmware ACK + retry)
-          NO  → send on the shared channel
-```
-
-**Dynamic route learning:** Every fully-reassembled inbound packet contributes to the route table. Bytes 1–10 of the RNS packet (the origin token, consistent across announce / path-reply / data sequences) are mapped to the MeshCore public key of the sender. Future outbound packets whose next-hop token matches an entry in this map are sent unicast, reducing channel load.
-
-### Edge Nodes and Downstream Clients
-
-An edge node (`can_route = no`) can host downstream client devices (phones, laptops) via a hotspot. RNS running on the edge node routes transparently between the MeshCore interface and the hotspot server interface. Client devices appear as first-class participants in the mesh from the perspective of infrastructure nodes.
-
-The `can_route = no` flag is advertised in RNSBIND messages so that other MeshCore peers do not attempt to use the edge node as a transit gateway to the wider mesh. It does **not** prevent the edge node from being used as a delivery path to its own identity or to clients behind it — the route map is built from observed traffic and is trusted unconditionally.
-
----
+3. Restart `rnsd`, or reload interfaces if your setup supports it.
+4. Every node participating in the same tunnel must use the same `channel_idx`, `channel_name`, and `channel_secret`.
 
 ## Configuration
 
-### Placing the Interface File
+Every node needs at minimum a transport block and matching channel identity. A full infrastructure/transport-node example:
 
-Reticulum discovers custom interface types by scanning the `interfaces/` subdirectory of the RNS config directory for Python files that define `interface_class`. The default config directory is `~/.reticulum/` on Linux/macOS and `%APPDATA%\reticulum\` on Windows.
+```ini
+[reticulum]
+  enable_transport = yes
+  share_instance = yes
 
-```bash
-# Linux / macOS default
-~/.reticulum/interfaces/MeshCore_Dynamic_Interface.py
+[logging]
+  loglevel = 4    # increase to 7 for debug
 
-# Explicit path (if your config is elsewhere)
-$RNS_CONFIG_DIR/interfaces/MeshCore_Dynamic_Interface.py
+[interfaces]
+
+  [[MeshCore Dynamic Interface]]
+    type = MeshCore_Dynamic_Interface
+    interface_enabled = yes
+
+    # Role
+    mode = access_point
+    can_route = yes
+
+    # Transport — uncomment exactly one block
+    # Serial (most common):
+    transport = serial
+    port = /dev/ttyUSB0
+    baudrate = 115200
+    #
+    # TCP (MeshCore node reachable over IP):
+    # transport = tcp
+    # host = 127.0.0.1
+    # tcp_port = 4403
+    #
+    # BLE:
+    # transport = ble
+    # ble_name =            # blank = connect to first found device
+
+    # Channel — all nodes on the same tunnel must share these values
+    channel_idx = 0
+    channel_name = RNSTunnel
+    channel_secret = <32 hex chars>   # openssl rand -hex 16
+
+    # Radio overrides — all four must be non-zero to take effect.
+    # Leave commented to use the values already stored on the MeshCore node.
+    # freq = 915.0        # MHz centre frequency
+    # bw   = 250.0        # kHz bandwidth (125 / 250 / 500)
+    # sf   = 10            # spreading factor (7-12)
+    # cr   = 5             # coding rate denominator (5=4/5 ... 8=4/8)
+
+    # Fragmentation
+    payload_size = 64         # bytes/fragment - see "Payload size" below
+    fragment_delay = 2.5      # seconds between channel-mode fragments
+    direct_frag_delay = 0.5   # seconds between direct-message fragments
+    fragment_timeout = 300    # 5-minute reassembly window for high-latency meshes
+
+    # Outgoing rate limiting (set to 0 to disable)
+    outgoing_announce_rate = 600     # min seconds between announces per dest
+    outgoing_path_req_rate = 1800    # min seconds between path requests per dest
+
+    # Optional hard bandwidth cap in bits per second (0 = disabled)
+    # rate_limit = 1200
+
+    # Peer discovery
+    allow_direct = yes    # use unicast direct messages when a route is known
+    peer_ttl = 86400      # seconds before a silent peer expires
+
+    debug_level = info    # info | debug
+
+  [[Backbone Interface]]
+    type = BackboneInterface
+    interface_enabled = yes
+    mode = boundary
+    target_host = <backbone-server-hostname-or-ip>
+    target_port = 4242
+    # Rate-limit announce re-propagation from the fast network
+    announce_rate_target  = 3600
+    announce_rate_grace   = 2
+    announce_rate_penalty = 7200
 ```
 
-### Parameter Reference
+### Interface mode
 
-| Parameter | Type | Default | Description |
-|---|---|---|---|
-| `transport` | `serial` \| `tcp` \| `ble` | `serial` | MeshCore connection method |
-| `port` | string | `/dev/ttyUSB0` | Serial device path (serial transport) |
-| `baudrate` | int | `115200` | Serial baud rate |
-| `host` | string | `127.0.0.1` | TCP host address (tcp transport) |
-| `tcp_port` | int | `4403` | TCP port (tcp transport) |
-| `ble_name` | string | *(empty)* | BLE device name; blank = first found (ble transport) |
-| `channel_idx` | int | `0` | MeshCore channel index |
-| `channel_name` | string | `RNSTunnel` | MeshCore channel name |
-| `channel_secret` | hex string | *(placeholder)* | 128-bit channel key as 32 hex chars — **must be changed** |
-| `freq` | float | `0` | Radio centre frequency in MHz (0 = use stored value) |
-| `bw` | float | `0` | Radio bandwidth in kHz (0 = use stored value) |
-| `sf` | int | `0` | Spreading factor 7–12 (0 = use stored value) |
-| `cr` | int | `0` | Coding rate denominator 5–8 (0 = use stored value) |
-| `payload_size` | int | `64` | Raw bytes per fragment before base64 encoding |
-| `fragment_delay` | float | `2.5` | Seconds between channel-broadcast fragments |
-| `direct_frag_delay` | float | `0.5` | Seconds between unicast direct-message fragments |
-| `fragment_timeout` | int | `3600` | Seconds before incomplete fragment sets are discarded |
-| `rate_limit` | int | `0` | Hard bandwidth cap in bits/second (0 = disabled) |
-| `outgoing_announce_rate` | int | `600` | Min seconds between forwarding announces per destination (0 = disabled) |
-| `outgoing_path_req_rate` | int | `1800` | Min seconds between forwarding path requests per destination (0 = disabled) |
-| `can_route` | `yes` \| `no` | `yes` | Advertise upstream routing capability to peers |
-| `allow_direct` | `yes` \| `no` | `yes` | Use unicast direct messages when a route is cached |
-| `peer_ttl` | int | `86400` | Seconds of silence before a peer entry is removed |
-| `debug_level` | `info` \| `debug` | `info` | Logging verbosity for this interface |
+Mode selection has a real impact on announce traffic, path expiry, and channel load — get it wrong and a LoRa channel can be flooded indefinitely.
 
-> **Radio overrides:** `freq`, `bw`, `sf`, and `cr` are only pushed to the MeshCore node if all four are non-zero. Leave them at `0` to use whatever parameters are stored on the node.
+**`access_point`** (recommended for infrastructure/transport nodes with backbone connectivity)
+Announces are not automatically re-broadcast on this interface, and paths to destinations behind it expire faster, matching the transient nature of battery-powered or intermittently-connected field devices. Path requests from clients are still forwarded and resolved on their behalf.
 
-> **Channel secret:** Generate a fresh key with `openssl rand -hex 16`. All nodes on the same tunnel must share the same `channel_idx`, `channel_name`, and `channel_secret`.
+> **Note:** AP mode only suppresses `ANNOUNCE` re-broadcasting. `DATA`+`PLAIN` path requests from the wider mesh for a recently-offline node still pass through AP mode onto the LoRa channel. Use `outgoing_path_req_rate` to throttle these independently.
 
----
+> ⚠️ **Never use `gateway` mode on a LoRa interface on a node that is also connected to a high-connectivity backbone.** Gateway mode proactively pushes *all* known announces to clients on that interface — with thousands of routes on the public Reticulum mesh, this will flood a shared LoRa channel indefinitely.
 
-## Network Topology Guide
+**`boundary`**
+Applied to the backbone/TCP interface connecting the slow radio segment to a fast LAN or the internet. Marks the network edge so the transport node doesn't treat the backbone as a client-facing interface for proactive path distribution.
 
-### Interface Mode Quick Reference
+Add announce rate control to the backbone interface to throttle how quickly announces from the wider network are re-propagated onto the radio side:
 
-| Node role | MeshCore interface mode | Backbone interface mode | `can_route` |
-|---|---|---|---|
-| Fixed infrastructure / gateway | `access_point` | `boundary` | `yes` |
-| Mobile / edge node | `roaming` | `boundary` | `no` |
+```ini
+announce_rate_target  = 3600   # min seconds between re-announces per dest
+announce_rate_grace   = 2      # violations tolerated before enforcement
+announce_rate_penalty = 7200   # extended quiet period after a violation
+```
 
-These modes come from the [Reticulum interface mode documentation](https://reticulum.network/manual/interfaces.html):
+### Payload size
 
-- **`access_point`** — Quiet by default. Announces are not proactively broadcast on this interface. Path requests from clients are still resolved. Use this on LoRa-facing interfaces at infrastructure nodes so the channel is not pre-populated with the entire known announce table from the backbone.
+MeshCore firmware silently truncates channel messages beyond a hardware-dependent character limit (commonly ~128 chars). The firmware also prepends the sender's node name when relaying channel messages, so the usable character budget for the encoded fragment is:
 
-- **`roaming`** — For physically mobile interfaces. Paths via roaming interfaces expire faster, preventing stale routing entries from accumulating at infrastructure nodes.
+```
+budget = firmware_limit - len(node_name) - 2        # ": " separator
+```
 
-- **`boundary`** — Marks the edge between significantly different network segments. Use this on backbone/TCP interfaces at both infrastructure and mobile nodes to prevent the faster network from being treated as a client-facing access network.
+Encoded message length for a given payload size:
 
-> **⚠️  Never use `gateway` mode on a LoRa interface that is backed by a high-connectivity transport node.** Gateway mode proactively pushes every known announce to clients on that interface. With thousands of routes from the public Reticulum mesh, this will flood a shared LoRa channel continuously.
+```
+msg_len = ceil((payload_size + HEADER_SIZE) * 4/3) + len("RNS:")
+```
 
-### Infrastructure Node
+With the default 6-byte header and `payload_size = 64`:
 
-A fixed node with a reliable backbone connection to the wider Reticulum mesh. Runs `rnsd` with `enable_transport = yes`. Listens for path requests from mobile nodes and resolves them via the backbone.
+```
+msg_len = ceil(70 * 4/3) + 4 = 98 chars   →  safe for node names up to ~28 characters at a 128-char firmware limit
+```
 
-Key settings:
-- MeshCore interface: `mode = access_point`, `can_route = yes`
-- Backbone interface: `mode = boundary` with `announce_rate_target` / `announce_rate_grace` / `announce_rate_penalty`
-- Longer `peer_ttl` (default 86400 s / 24 h) appropriate for fixed nodes
+To size `payload_size` for your own node name length:
 
-### Mobile / Edge Node
+```
+budget      = firmware_limit - len(node_name) - 2
+max_payload = floor((budget - 4) * 3/4) - HEADER_SIZE
+```
 
-A portable node that carries a MeshCore radio and optionally a hotspot for downstream clients. May or may not have backbone connectivity depending on location. Runs `rnsd` with `enable_transport = yes`.
+## How it works
 
-Key settings:
-- MeshCore interface: `mode = roaming`, `can_route = no`
-- Backbone interface: `mode = boundary`, `interface_enabled = no` (enable manually or conditionally when on home LAN)
-- Shorter `peer_ttl` (e.g. `7200` s / 2 h) so infrastructure nodes stop generating path requests after the node goes offline
-- Hotspot server interface (`TCPServerInterface` or `AutoInterface`) for downstream clients
+### Wire format
 
-### Client Devices
+Each RNS binary packet is split into `payload_size`-byte chunks. Each chunk is encoded as a MeshCore channel (or direct) message:
 
-End-user devices (Android phones running Sideband, laptops running NomadNet, etc.) that connect to a mobile node's hotspot. These do not run rnsd in transport mode. Configure them to connect to the mobile node's hotspot IP and RNS server port.
+```
+"RNS:" + base64url( [frag_idx:1][pkt_id:4][frag_total:1] + payload )
+```
 
----
+Base64 padding is stripped before transmission and restored on receipt.
 
-## Troubleshooting
+### Peer discovery
 
-### Announce flooding on the LoRa channel
+Discovery is demand-driven rather than push/periodic, to minimize channel airtime:
 
-**Symptom:** Continuous stream of `RNS:` messages on the MeshCore channel even with no active sessions.
+1. A node with no known peers sends `RNSBIND_REQ:<pubkey>:<cap>` on the channel, advertising its own routing capability alongside its identity.
+2. Overhearing nodes immediately record the requester (passive learning), wait a random backoff (`BIND_BACKOFF_MIN`–`BIND_BACKOFF_MAX` seconds), then reply with `RNSBIND:<pubkey>:<cap>`. The randomized backoff spreads responses out in time to avoid a simultaneous burst on the shared half-duplex channel.
+3. Every node overhearing *any* `RNSBIND` response also records the responder, so a single discovery round passively populates every peer table on the channel.
+4. Once peers are known, a quiet `RNSBIND` heartbeat goes out every `BIND_HEARTBEAT_S` (default: 1 hour) — no response is solicited.
 
-**Cause:** Almost always `gateway` or `access_point`-with-wrong-mode on the MeshCore interface of a node that has a high-connectivity backbone connection. In gateway mode, RNS pushes every known announce to all clients on that interface.
+The capability suffix (`R` = router, `E` = edge) tells peers at discovery time whether a node has upstream connectivity worth routing transit traffic through. It's recorded and logged but doesn't gate per-packet routing decisions — the interface's live route map is built from observed packet flow, and a path that has demonstrably worked (including through an edge node to reach a downstream client) is used regardless of the advertised capability.
 
-**Fix:**
-1. Confirm the MeshCore interface on your infrastructure node is `mode = access_point` (not `gateway`).
-2. Add `announce_rate_target`, `announce_rate_grace`, and `announce_rate_penalty` to the backbone interface.
-3. Set `outgoing_announce_rate` on the MeshCore interface config.
+### RNS header parsing
 
----
+The interface inspects the RNS header byte to distinguish packet types (`DATA`, `ANNOUNCE`, `LINKREQUEST`, `PROOF`) and destination types (`SINGLE`, `GROUP`, `PLAIN`, `LINK`), and locally derives the destination hash for established Links (whose destination field becomes an ephemeral Link ID after handshake) so that direct-message routing continues to work for the life of the Link.
 
-### Silent truncation / broken base64
+### Delivery confirmation
 
-**Symptom:** Packets arrive but are never fully reassembled. Debug logs show fragments arriving but the packet never completes.
+A MeshCore `MSG_SENT` result only confirms the local radio queued the frame — it isn't end-to-end delivery confirmation. For direct sends, the interface waits on the firmware's follow-up `ACK` event (matched via the `expected_ack` tag from `MSG_SENT`), bounded by `direct_ack_timeout` and a hard ceiling `direct_ack_timeout_max` so that a flood-mode peer with a long firmware-suggested timeout can't stall every other fragment behind it in the shared outgoing queue. A failed or unacknowledged direct send falls back to a channel broadcast.
 
-**Cause:** `payload_size` is set too high. MeshCore firmware silently truncates messages that exceed its internal character limit (~128 chars on most builds). The truncated message decodes as a different (shorter) fragment, which never combines with the others.
+## Transports
 
-**Fix:** Lower `payload_size`. The default of 64 is conservative and correct for most deployments. Use the formula in the [Wire Format](#wire-format) section to find the exact limit for your node name length.
+| Transport | Config keys |
+|---|---|
+| Serial (default) | `port`, `baudrate` |
+| TCP | `host`, `tcp_port` |
+| BLE | `ble_name` (blank = connect to first device found) |
 
----
+## Tuning reference
 
-### Path request flooding (offline node)
+| Key | Default | Purpose |
+|---|---|---|
+| `payload_size` | `64` | Fragment payload size in bytes; see [Payload size](#payload-size) |
+| `fragment_delay` | `2.5` | Seconds between channel-mode fragments |
+| `direct_frag_delay` | `0.5` | Seconds between direct-message fragments |
+| `fragment_timeout` | `300` | Reassembly window for incomplete multi-fragment packets |
+| `direct_ack_timeout` | `4.0` | Minimum wait for a direct-send delivery ACK |
+| `direct_ack_timeout_max` | `8.0` | Hard ceiling on the ACK wait regardless of firmware suggestion |
+| `outgoing_announce_rate` | `600` | Minimum seconds between announces per destination (`0` disables) |
+| `outgoing_path_req_rate` | `1800` | Minimum seconds between path requests per destination (`0` disables) |
+| `rate_limit` | `0` | Optional hard bandwidth cap in bits/second (`0` disables) |
+| `allow_direct` | `yes` | Use unicast direct messages when a route to the peer is known |
+| `peer_ttl` | `86400` | Seconds before a silent peer is dropped from the peer table |
+| `can_route` | `yes` | Whether this node can carry transit traffic |
+| `debug_level` | `info` | `info` or `debug` |
 
-**Symptom:** Continuous `RNS:` messages on the channel after a mobile node goes offline, even though no one is trying to communicate with it.
+## Limitations
 
-**Cause:** Remote nodes on the wider Reticulum mesh still have a path to the offline node and are sending path requests to find it. AP mode does NOT suppress path requests — it only blocks announce re-broadcasting.
-
-**Fix:**
-1. Set `outgoing_path_req_rate = 1800` (or higher) on the infrastructure node's MeshCore interface.
-2. Set a short `peer_ttl` on the mobile node's configuration so that infrastructure nodes expire the stale peer entry sooner and stop generating path requests for it.
-
----
-
-### No peers discovered
-
-**Symptom:** The interface starts, sends RNSBIND_REQ, but no peers respond. Retries exhaust and the interface falls back to heartbeat mode.
-
-**Checks:**
-1. Confirm all nodes share the same `channel_idx`, `channel_name`, and `channel_secret`.
-2. Verify the MeshCore node is actually online and connected (`rnsd` log will show the node name and key if `_async_setup` succeeds).
-3. Check that `debug_level = debug` is set and look for `REQ from` log entries — if the remote node sees the REQ, it will log it.
-4. Confirm no firewall or serial permission issue is preventing the driver from connecting (the `Driver init error` log line will appear if so).
-
----
-
-### Direct messages not being used
-
-**Symptom:** All traffic goes over the channel even after sessions are established.
-
-**Checks:**
-1. Confirm `allow_direct = yes` on both nodes.
-2. Check that the MeshCore library version supports `send_msg` — the interface logs `has_direct_api = False` at startup if the method is absent.
-3. Route learning requires at least one inbound packet from the remote peer. If the remote node has not yet sent anything, the route map entry will not exist.
-
----
-
-## Known Limitations
-
-- **Fragment ordering assumes in-order delivery.** MeshCore channel messages are generally delivered in order within a single burst. Out-of-order delivery (possible with retries or multi-hop routing) will still reassemble correctly because fragments are indexed, but stale fragments from a previous incomplete burst with the same `pkt_id` could corrupt reassembly. The `fragment_timeout` setting limits the window during which this can occur.
-
-- **`pkt_id` is 8-bit (0–255).** Rollover is possible under sustained high-throughput conditions. In practice, with per-fragment delays of 0.5–2.5 seconds, rollover takes several minutes and is extremely unlikely to cause a collision in the reassembly buffer.
-
-- **BLE transport is untested by the author.** The code follows the meshcore-py API but BLE connection reliability is hardware and OS dependent.
-
-- **Radio parameter overrides are best-effort.** If the MeshCore node rejects the `set_radio` command (e.g. due to firmware version differences), the interface logs a warning and continues with stored radio parameters.
-
----
-
-## Related Projects
-
-- [Reticulum Network Stack](https://github.com/markqvist/Reticulum)
-- [MeshCore firmware](https://github.com/ripplebiz/MeshCore)
-- [meshcore-py](https://github.com/ripplebiz/meshcore-py) — Python library for communicating with MeshCore nodes
-- [Sideband](https://github.com/markqvist/Sideband) — RNS messaging app for Android and desktop
-- [NomadNet](https://github.com/markqvist/NomadNet) — Decentralised mesh communication platform built on RNS
-
----
-
-## Contributing
-
-Issues and pull requests are welcome. If you find a bug or have a question, please include:
-
-- The relevant section of your `~/.reticulum/config`
-- The interface log output at `debug_level = debug`
-- Your MeshCore firmware version and transport type (serial / TCP / BLE)
-- Your meshcore-py version (`pip show meshcore`)
-
----
-
-Yes, I absolutely had help from Claude on this. I'm not a software person, I'm just dumb enough to think I can beat my head against something until it works. PLEASE feel free to offer improvements and corrections.
+- MeshCore's channel-message character limit varies by firmware build and must be accounted for when choosing `payload_size` (see [Payload size](#payload-size)).
+- `access_point` mode suppresses announce re-broadcasting but not `DATA`+`PLAIN` path requests; a node that flaps offline can still generate path-request traffic on the LoRa channel from remote nodes searching for it. Use `outgoing_path_req_rate` to bound this.
+- This interface is built and tested against a specific `meshcore` library API surface; firmware/library version drift may require updates to event/attribute names.
