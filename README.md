@@ -226,3 +226,5 @@ A MeshCore `MSG_SENT` result only confirms the local radio queued the frame — 
 - MeshCore's channel-message character limit varies by firmware build and must be accounted for when choosing `payload_size` (see [Payload size](#payload-size)).
 - `access_point` mode suppresses announce re-broadcasting but not `DATA`+`PLAIN` path requests; a node that flaps offline can still generate path-request traffic on the LoRa channel from remote nodes searching for it. Use `outgoing_path_req_rate` to bound this.
 - This interface is built and tested against a specific `meshcore` library API surface; firmware/library version drift may require updates to event/attribute names.
+
+Yes, I absolutely had help from Claude on this. I'm not a software person, I'm just stubborn enough to think I can beat my head against something until it works. PLEASE feel free to offer improvements and corrections.
