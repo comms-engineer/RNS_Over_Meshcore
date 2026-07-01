@@ -349,6 +349,14 @@ class MeshCore_Dynamic_Interface(Interface):
         # length/airtime); we wait whichever of the two is longer.
         self.direct_ack_timeout_s = float(cfg.get("direct_ack_timeout", 4.0))
 
+        # Hard ceiling on that wait, regardless of what the firmware suggests.
+        # A contact with no known path (flood mode) can report a suggested
+        # timeout of many seconds to minutes; since the outgoing worker is a
+        # single shared queue, waiting that long would stall every other
+        # queued fragment behind it. Our own CHANNEL fallback is cheap, so we
+        # cap the wait and let the fallback handle it instead.
+        self.direct_ack_timeout_max_s = float(cfg.get("direct_ack_timeout_max", 8.0))
+
         # Default adjusted to 300s (5 minutes) for high-latency meshes
         self.fragment_timeout_s = float(cfg.get("fragment_timeout", 300.0))
         self.rate_limit_bps     = int(cfg.get("rate_limit", 0))
@@ -1133,9 +1141,31 @@ class MeshCore_Dynamic_Interface(Interface):
                             else str(exp_ack)
                         )
                         suggested_ms = result.payload.get("suggested_timeout", 0) or 0
-                        ack_timeout = max(
+                        # NOTE: for a contact with out_path_len == -1 (no known
+                        # route -- flood mode), the firmware's suggested_timeout
+                        # can be very large, since it has to budget for a full
+                        # flood-and-wait cycle. _async_outgoing_worker is a
+                        # single task pulling from one shared queue -- an
+                        # uncapped wait here stalls EVERY other queued fragment
+                        # (channel broadcasts, other peers) for however long the
+                        # firmware suggests, which can be minutes. We deliberately
+                        # cap it: our own CHANNEL fallback is cheap, so there's no
+                        # reason to let one flood-mode contact block the whole
+                        # queue for as long as the radio itself would wait.
+                        raw_ack_timeout = max(
                             self.direct_ack_timeout_s, (suggested_ms / 1000.0) * 1.2
                         )
+                        ack_timeout = min(raw_ack_timeout, self.direct_ack_timeout_max_s)
+                        if raw_ack_timeout > ack_timeout:
+                            RNS.log(
+                                f"MeshCore_Dynamic_Interface [{self.name}]: "
+                                f"Firmware suggested {suggested_ms}ms ACK timeout for "
+                                f"peer key {target[:12] if target else '?'}... "
+                                f"(likely flood/no-path) -- capping wait at "
+                                f"{ack_timeout:.1f}s instead of {raw_ack_timeout:.1f}s "
+                                f"to avoid blocking the outgoing queue.",
+                                RNS.LOG_INFO
+                            )
                         ack = await self._mc.dispatcher.wait_for_event(
                             self._EventType.ACK,
                             attribute_filters={"code": exp_ack_hex},
@@ -1144,7 +1174,8 @@ class MeshCore_Dynamic_Interface(Interface):
                         if ack is None:
                             raise RuntimeError(
                                 f"no delivery ACK within {ack_timeout:.1f}s "
-                                f"(expected_ack={exp_ack_hex})"
+                                f"(expected_ack={exp_ack_hex}, "
+                                f"firmware suggested {suggested_ms}ms)"
                             )
                 else:
                     await self._mc.commands.send_chan_msg(self.channel_idx, frag_str)
