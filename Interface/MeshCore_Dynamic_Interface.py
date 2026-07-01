@@ -343,6 +343,12 @@ class MeshCore_Dynamic_Interface(Interface):
         raw_dfd = cfg.get("direct_frag_delay", None)
         self.direct_frag_delay_s = float(raw_dfd) if raw_dfd is not None else 0.5
 
+        # Minimum time to wait for a delivery ACK on a DIRECT send before
+        # treating it as failed and falling back to CHANNEL. The radio also
+        # hands back its own per-send "suggested_timeout" (based on path
+        # length/airtime); we wait whichever of the two is longer.
+        self.direct_ack_timeout_s = float(cfg.get("direct_ack_timeout", 4.0))
+
         # Default adjusted to 300s (5 minutes) for high-latency meshes
         self.fragment_timeout_s = float(cfg.get("fragment_timeout", 300.0))
         self.rate_limit_bps     = int(cfg.get("rate_limit", 0))
@@ -1104,19 +1110,42 @@ class MeshCore_Dynamic_Interface(Interface):
             try:
                 if mode == "direct":
                     result = await self._mc.commands.send_msg(target, frag_str)
-                    # send_msg() does not raise on a failed/pathless delivery -- it
-                    # returns an Event whose .type may be ERROR (e.g. no known
-                    # out_path to this contact yet). A bare await here treats that
-                    # ERROR event as success, silently dropping the fragment.
-                    # FIX: explicitly check the returned event and treat non-MSG_SENT
-                    # as a failure so it falls through to the same except-block
-                    # fallback used for real exceptions.
                     if result is None or result.type != self._EventType.MSG_SENT:
                         reason = (
                             result.payload.get("reason", "no path/unknown")
                             if result is not None else "no response"
                         )
-                        raise RuntimeError(f"direct send not confirmed: {reason}")
+                        raise RuntimeError(f"direct send rejected: {reason}")
+
+                    # CORRECTED UNDERSTANDING: MSG_SENT only confirms the local
+                    # radio queued the frame for transmission -- it is NOT
+                    # end-to-end delivery confirmation. The firmware hands back
+                    # an "expected_ack" tag in the MSG_SENT payload; actual
+                    # over-air delivery is confirmed later (if at all) by a
+                    # separate ACK event carrying that same tag. Without
+                    # waiting on it, a frame that never reaches the peer
+                    # (out of range, collision, stale/broken path) is
+                    # indistinguishable from one that was delivered.
+                    exp_ack = result.payload.get("expected_ack")
+                    if exp_ack is not None:
+                        exp_ack_hex = (
+                            exp_ack.hex() if isinstance(exp_ack, (bytes, bytearray))
+                            else str(exp_ack)
+                        )
+                        suggested_ms = result.payload.get("suggested_timeout", 0) or 0
+                        ack_timeout = max(
+                            self.direct_ack_timeout_s, (suggested_ms / 1000.0) * 1.2
+                        )
+                        ack = await self._mc.dispatcher.wait_for_event(
+                            self._EventType.ACK,
+                            attribute_filters={"code": exp_ack_hex},
+                            timeout=ack_timeout,
+                        )
+                        if ack is None:
+                            raise RuntimeError(
+                                f"no delivery ACK within {ack_timeout:.1f}s "
+                                f"(expected_ack={exp_ack_hex})"
+                            )
                 else:
                     await self._mc.commands.send_chan_msg(self.channel_idx, frag_str)
             except Exception as exc:
@@ -1142,7 +1171,7 @@ class MeshCore_Dynamic_Interface(Interface):
                         f"MeshCore_Dynamic_Interface [{self.name}]: "
                         f"DIRECT send to peer key {target[:12] if target else '?'}... "
                         f"failed ({exc}) [{path_info}] -- falling back to CHANNEL.",
-                        RNS.LOG_DEBUG
+                        RNS.LOG_INFO
                     )
                     try:
                         # Fallback to channel if targeted routing exceptions happen mid-transit
