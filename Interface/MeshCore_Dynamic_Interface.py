@@ -543,6 +543,29 @@ class MeshCore_Dynamic_Interface(Interface):
         # mobile devices; 86400 s for fixed infrastructure nodes).
         self.peer_ttl_s = float(cfg.get("peer_ttl", 86400))
 
+        # --- Delay tolerance / RNS timing model -----------------------------
+        # bitrate: the ONE value RNS uses to compute how patient it is with
+        # this interface. It directly drives (see RNS/Transport.py):
+        #   first_hop_timeout()        = MTU * (8/bitrate) + DEFAULT_PER_HOP_TIMEOUT
+        #   extra_link_proof_timeout() = MTU * (8/bitrate)
+        # ...which feed into link establishment timeout, path request
+        # timeout, and how long RNS/LXMF wait for a PROOF before giving up
+        # and retrying. If this is never set, RNS falls back to a generic
+        # hardware-speed guess — nowhere close to real MeshCore LoRa airtime,
+        # and with NO allowance for a repeater's flood-routing jitter window
+        # sitting between two direct neighbors. That mismatch is what was
+        # causing RNS/LXMF to declare "failed" and start a fresh retry cycle
+        # while a fragment was still legitimately in flight.
+        #
+        # Set this to a conservative *effective* throughput: real LoRa
+        # airtime at your configured SF/BW, further derated for the repeater
+        # rebroadcasting your traffic and contending for the same channel.
+        # Default of 300 bps is deliberately pessimistic (typical raw LoRa
+        # airtime at moderate SF is faster than this) to bake in headroom for
+        # repeater jitter and shared-channel contention; tighten it once you
+        # have real RTT data from rnstatus/rnprobe on a busy channel.
+        self.bitrate = int(cfg.get("bitrate", 300))
+
         # --- Debug verbosity -----------------------------------------------
         self.debug_level = cfg.get("debug_level", "info").lower()
 
