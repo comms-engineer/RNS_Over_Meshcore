@@ -995,7 +995,7 @@ class MeshCore_Dynamic_Interface(Interface):
 
     def process_outgoing(self, data):
         return self.processOutgoing(data)
-
+    
     def processOutgoing(self, data):
         if not self.online:
             return
@@ -1026,7 +1026,7 @@ class MeshCore_Dynamic_Interface(Interface):
 
         with self._pkt_id_lock:
             pkt_id       = self._pkt_id
-            self._pkt_id = (self._pkt_id + 1) & 0xFFFFFFFF  # 32-bit bound integer tracking
+            self._pkt_id = (self._pkt_id + 1) & 0xFFFFFFFF  
 
         handler   = _PacketHandler(data, pkt_id, self.payload_size)
         broadcast = self._is_broadcast_packet(data)
@@ -1054,64 +1054,88 @@ class MeshCore_Dynamic_Interface(Interface):
                 f"Routing -> CHANNEL. Reason: {channel_reason}",
                 RNS.LOG_INFO
             )
-            route = [("channel", None)]
+            mode, target = "channel", None
         else:
             RNS.log(
                 f"MeshCore_Dynamic_Interface [{self.name}]: "
                 f"Routing -> DIRECT via peer key {target_key[:12]}...",
                 RNS.LOG_INFO
             )
-            route = [("direct", target_key)]
+            mode, target = "direct", target_key
             
-        for frag_str in handler.fragments:
-            for mode, target in route:
-                try:
-                    # Thread-safe blocking put handles backpressure cleanly
-                    self._outqueue.put((mode, target, frag_str), block=True, timeout=None)
-                except Exception:
-                    pass
+        try:
+            # Enqueue the ENTIRE list of fragments as a single atomic transaction
+            self._outqueue.put((mode, target, handler.fragments), block=True, timeout=None)
+        except Exception as exc:
+            RNS.log(f"MeshCore_Dynamic_Interface [{self.name}]: Queue write failed: {exc}", RNS.LOG_ERROR)
 
         self.txb += len(data)
 
     async def _async_outgoing_worker(self):
         """
-        Worker task pulling payload chunks from the thread-safe synchronized queue
-        using the event loop executor pool to preserve pure async interface execution.
+        Worker task pulling atomic fragment trains from the synchronized queue.
+        Dispatches sub-fragments with minimal hardware pacing, then enforces
+        macro-delays between complete RNS packets.
         """
         while True:
             if not self.online or self._mc is None:
                 await asyncio.sleep(0.5)
                 continue
 
-            # Safe non-blocking cross-thread extraction via run_in_executor
+            # Extract the atomic item (contains the full list of fragments)
             item = await self._loop.run_in_executor(None, self._outqueue.get)
-            mode, target, frag_str = item
+            mode, target, fragments = item
 
-            try:
-                if mode == "direct":
-                    await self._mc.commands.send_msg(target, frag_str)
-                else:
-                    await self._mc.commands.send_chan_msg(self.channel_idx, frag_str)
-            except Exception:
-                if mode == "direct":
-                    try:
-                        # Fallback to channel if targeted routing exceptions happen mid-transit
-                        self._outqueue.put_nowait(("channel", None, frag_str))
-                    except queue.Full:
-                        pass
+            packet_failed = False
+            total_chars_sent = 0
+
+            for idx, frag_str in enumerate(fragments):
+                try:
+                    if mode == "direct":
+                        await self._mc.commands.send_msg(target, frag_str)
+                    else:
+                        await self._mc.commands.send_chan_msg(self.channel_idx, frag_str)
+                    
+                    total_chars_sent += len(frag_str)
+                except Exception as exc:
+                    RNS.log(
+                        f"MeshCore_Dynamic_Interface [{self.name}]: "
+                        f"TX failed during fragment {idx+1}/{len(fragments)}: {exc}", 
+                        RNS.LOG_WARNING
+                    )
+                    if mode == "direct":
+                        packet_failed = True
+                    break
+                
+                # Pacing delay INSIDE a single RNS packet burst
+                # Just enough to clear the local UART/firmware buffer without triggering duty-cycle drops
+                if idx < len(fragments) - 1:
+                    intra_delay = 0.05 if mode == "direct" else 0.25
+                    await asyncio.sleep(intra_delay)
+
+            # Fallback handling if a directed route link drops mid-burst
+            if packet_failed:
+                RNS.log(f"MeshCore_Dynamic_Interface [{self.name}]: Direct burst failed. Falling back to channel routing.", RNS.LOG_WARNING)
+                try:
+                    self._outqueue.put_nowait(("channel", None, fragments))
+                except queue.Full:
+                    RNS.log(f"MeshCore_Dynamic_Interface [{self.name}]: Queue full, dropping fallback packet.", RNS.LOG_ERROR)
                 self._outqueue.task_done()
                 continue
 
-            delay = (
+            # Macro-delay applied AFTER the entire fragment train has cleared the interface
+            macro_delay = (
                 self.direct_frag_delay_s
                 if mode == "direct"
                 else self.fragment_delay_s
             )
-            if self.rate_limit_bps > 0:
-                bits  = (len(frag_str) * 3 // 4) * 8
-                delay = max(delay, bits / self.rate_limit_bps)
+            
+            if self.rate_limit_bps > 0 and total_chars_sent > 0:
+                # Calculate bit overhead from the base64 character footprint
+                bits  = (total_chars_sent * 3 // 4) * 8
+                macro_delay = max(macro_delay, bits / self.rate_limit_bps)
 
-            await asyncio.sleep(delay)
+            await asyncio.sleep(macro_delay)
             self._outqueue.task_done()
 
     # -------------------------------------------------------------------------
