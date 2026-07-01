@@ -12,7 +12,7 @@ WIRE FORMAT
 Each RNS binary packet is split into payload-sized chunks.  Each chunk is
 encoded as a MeshCore channel (or direct) message:
 
-    "RNS:" + base64url( [frag_idx:1][pkt_id:1][frag_total:1] + payload )
+    "RNS:" + base64url( [frag_idx:1][pkt_id:4][frag_total:1] + payload )
 
 No base64 padding is transmitted; the receiver restores it before decode.
 
@@ -43,9 +43,9 @@ PAYLOAD SIZE
   Encoded message length:
       msg_len = ceil((payload_size + HEADER_SIZE) * 4/3) + len("RNS:")
 
-  With the default payload_size = 64:
-      msg_len = ceil(67 * 4/3) + 4 = 90 + 4 = 94 chars
-      Safe for node names up to ~30 characters at a 128-char firmware limit.
+  With a 4-byte pkt_id, HEADER_SIZE is 6 bytes. With default payload_size = 64:
+      msg_len = ceil(70 * 4/3) + 4 = 94 + 4 = 98 chars
+      Safe for node names up to ~28 characters at a 128-char firmware limit.
 
   To calculate the maximum safe payload size for your node name length:
       budget      = firmware_limit - len(node_name) - 2
@@ -180,7 +180,7 @@ INFRASTRUCTURE / TRANSPORT NODE  (fixed gateway with backbone connectivity)
   │     payload_size = 64      # bytes/fragment (see PAYLOAD SIZE note)    │
   │     fragment_delay = 2.5   # seconds between channel-mode fragments    │
   │     direct_frag_delay = 0.5  # seconds between direct-message frags   │
-  │     fragment_timeout = 3600  # seconds before stale frags discarded    │
+  │     fragment_timeout = 300   # 5-minute window for high-latency meshes │
   │                                                                         │
   │     # Outgoing rate limiting (set to 0 to disable)                     │
   │     outgoing_announce_rate = 600    # min s between announces per dest │
@@ -206,124 +206,6 @@ INFRASTRUCTURE / TRANSPORT NODE  (fixed gateway with backbone connectivity)
   │     announce_rate_grace   = 2                                           │
   │     announce_rate_penalty = 7200                                        │
   └─────────────────────────────────────────────────────────────────────────┘
-
-MOBILE / CLIENT NODE  (portable device, no guaranteed upstream connectivity)
-──────────────────────────────────────────────────────────────────────────────
-  [[MeshCore Dynamic Interface]]   mode = roaming    can_route = no
-  [[Backbone/TCP Interface]]       mode = boundary   (when present)
-
-  roaming
-    The interface is physically mobile from the perspective of infrastructure
-    nodes.  Paths via roaming interfaces expire faster, preventing stale
-    routing entries from accumulating at the transport node.
-
-  can_route = no
-    Advertises to all peers at discovery time that this node cannot carry
-    traffic to the wider mesh.  Peers will not attempt to use it as an upstream
-    gateway.  The node remains fully functional for direct P2P messaging and
-    for serving client devices (phones, laptops) connected behind it.
-
-  peer_ttl
-    Set a short peer_ttl on mobile nodes so that infrastructure nodes stop
-    forwarding path requests for them onto the LoRa channel sooner after they
-    go offline.  A value matching the expected maximum offline duration of the
-    device is appropriate (e.g. 7200 s for a device used within a single day).
-
-  If the mobile node hosts a hotspot for downstream client devices (phones,
-  laptops), add a server interface on the hotspot subnet.  Use TCPServerInterface
-  for explicit client configuration, or AutoInterface for zero-config mDNS
-  discovery (supported by Sideband and NomadNet).
-
-  Full example — mobile / edge node
-  ┌─────────────────────────────────────────────────────────────────────────┐
-  │ [reticulum]                                                             │
-  │   enable_transport = yes                                                │
-  │   share_instance = yes                                                  │
-  │                                                                         │
-  │ [logging]                                                               │
-  │   loglevel = 4                                                          │
-  │                                                                         │
-  │ [interfaces]                                                            │
-  │                                                                         │
-  │   [[MeshCore Dynamic Interface]]                                        │
-  │     type = MeshCore_Dynamic_Interface                                   │
-  │     interface_enabled = yes                                             │
-  │                                                                         │
-  │     # Role                                                              │
-  │     mode = roaming                                                      │
-  │     can_route = no                                                      │
-  │                                                                         │
-  │     # Transport — uncomment exactly one block                          │
-  │     # Serial:                                                           │
-  │     transport = serial                                                  │
-  │     port = /dev/ttyACM0                                                 │
-  │     baudrate = 115200                                                   │
-  │     #                                                                   │
-  │     # TCP:                                                              │
-  │     # transport = tcp                                                   │
-  │     # host = 127.0.0.1                                                 │
-  │     # tcp_port = 4403                                                   │
-  │     #                                                                   │
-  │     # BLE:                                                              │
-  │     # transport = ble                                                   │
-  │     # ble_name =           # blank = connect to first found device     │
-  │                                                                         │
-  │     # Channel — must match all other nodes on the tunnel               │
-  │     channel_idx = 0                                                     │
-  │     channel_name = RNSTunnel                                            │
-  │     channel_secret = <same key as infrastructure node>                 │
-  │                                                                         │
-  │     # Radio overrides (leave commented to use stored node values)      │
-  │     # freq = 915.0                                                      │
-  │     # bw   = 250.0                                                      │
-  │     # sf   = 10                                                         │
-  │     # cr   = 5                                                          │
-  │                                                                         │
-  │     # Fragmentation                                                     │
-  │     payload_size = 64                                                   │
-  │     fragment_delay = 2.5                                                │
-  │     direct_frag_delay = 0.5                                             │
-  │     fragment_timeout = 3600                                             │
-  │                                                                         │
-  │     # Outgoing rate limiting                                            │
-  │     outgoing_announce_rate = 600                                        │
-  │     outgoing_path_req_rate = 1800                                       │
-  │                                                                         │
-  │     # Peer discovery                                                    │
-  │     allow_direct = yes                                                  │
-  │     peer_ttl = 7200        # short TTL for intermittently-connected    │
-  │                            # devices; adjust to max expected offline   │
-  │                            # window (seconds)                          │
-  │                                                                         │
-  │     debug_level = info                                                  │
-  │                                                                         │
-  │   # Backbone — disable when operating away from the home network.      │
-  │   # Enable when connected to a fixed LAN with upstream transport.      │
-  │   [[Backbone Interface]]                                                │
-  │     type = BackboneInterface                                            │
-  │     interface_enabled = no   # toggle yes when on home LAN             │
-  │     mode = boundary                                                     │
-  │     target_host = <backbone-server-hostname-or-ip>                     │
-  │     target_port = 4242                                                  │
-  │                                                                         │
-  │   # Hotspot server — for phones or laptops connected to this node's    │
-  │   # WiFi AP.  Use the hotspot gateway IP as listen_ip.                 │
-  │   # Option A: explicit TCP (client must configure server address)      │
-  │   [[Hotspot TCP Server]]                                                │
-  │     type = TCPServerInterface                                           │
-  │     interface_enabled = yes                                             │
-  │     mode = access_point                                                 │
-  │     listen_ip = 192.168.4.1                                             │
-  │     listen_port = 4242                                                  │
-  │                                                                         │
-  │   # Option B: AutoInterface (zero-config mDNS discovery)               │
-  │   # [[Hotspot AutoInterface]]                                           │
-  │   #   type = AutoInterface                                              │
-  │   #   interface_enabled = yes                                           │
-  │   #   mode = access_point                                               │
-  │   #   devices = wlan0      # hotspot interface name                    │
-  │   #   outgoing = yes                                                    │
-  └─────────────────────────────────────────────────────────────────────────┘
 """
 
 import RNS
@@ -331,10 +213,11 @@ from RNS.Interfaces.Interface import Interface
 import asyncio
 import base64
 import hashlib
+import struct
+import queue
 import random
 import threading
 import time
-from collections import OrderedDict
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -344,19 +227,15 @@ from collections import OrderedDict
 class _PacketHandler:
     """
     Encodes one RNS binary packet into one or more channel/direct message
-    strings.  Each fragment carries a 3-byte binary header:
+    strings. Each fragment carries a 6-byte binary header:
 
-        [ frag_idx : 1 byte ] [ pkt_id : 1 byte ] [ frag_total : 1 byte ]
+        [ frag_idx : 1 byte ] [ pkt_id : 4 bytes ] [ frag_total : 1 byte ]
 
     followed by the raw payload chunk.  The combined bytes are base64url-
     encoded (no padding) and prefixed with MSG_PREFIX ("RNS:").
     """
 
-    HEADER_SIZE  = 3
-    # Default payload bytes per fragment.  Gives ~94-char encoded messages,
-    # safely under the observed ~128-char MeshCore firmware truncation limit
-    # even with typical node name prefixes.  See module docstring for the
-    # sizing formula if your node name is unusually long.
+    HEADER_SIZE  = 6  # 1 byte idx + 4 bytes pkt_id + 1 byte total
     PAYLOAD_SIZE = 64
     MSG_PREFIX   = "RNS:"
 
@@ -364,12 +243,13 @@ class _PacketHandler:
         ps = payload_size if payload_size > 0 else self.PAYLOAD_SIZE
         raw_chunks = [data[i:i + ps] for i in range(0, len(data), ps)]
         total = len(raw_chunks)
-        self.fragments = [
-            self.MSG_PREFIX + base64.urlsafe_b64encode(
-                bytes([idx & 0xFF, pkt_id & 0xFF, total & 0xFF]) + chunk
-            ).rstrip(b"=").decode()
-            for idx, chunk in enumerate(raw_chunks)
-        ]
+        
+        self.fragments = []
+        for idx, chunk in enumerate(raw_chunks):
+            # Header layout packed big-endian: B (1B index), I (4B packet ID), B (1B total fragments)
+            header = struct.pack(">BIB", idx & 0xFF, pkt_id & 0xFFFFFFFF, total & 0xFF)
+            encoded = base64.urlsafe_b64encode(header + chunk).rstrip(b"=").decode()
+            self.fragments.append(self.MSG_PREFIX + encoded)
 
     def __len__(self):
         return len(self.fragments)
@@ -391,62 +271,37 @@ class MeshCore_Dynamic_Interface(Interface):
 
     MSG_PREFIX      = _PacketHandler.MSG_PREFIX
 
-    # Bind protocol prefixes.
-    # NOTE: RNSBIND: is a literal substring of RNSBIND_REQ:.  Both text.find()
-    # calls may return the same index on a REQ message.  The disambiguation
-    # logic in _handle_bind and _on_channel_msg relies on this property and
-    # handles it correctly — do not change these strings independently.
     BIND_PREFIX     = "RNSBIND:"
     BIND_REQ_PREFIX = "RNSBIND_REQ:"
 
-    # Routing capability tokens embedded in RNSBIND / RNSBIND_REQ messages.
-    CAPABILITY_ROUTER = "R"   # Node has upstream connectivity; safe to route via
-    CAPABILITY_EDGE   = "E"   # No upstream; do not use as a transit gateway
+    CAPABILITY_ROUTER = "R"
+    CAPABILITY_EDGE   = "E"
 
     HEADER_SIZE      = _PacketHandler.HEADER_SIZE
     OUTQUEUE_MAXSIZE = 512
     SETUP_TIMEOUT_S  = 30
 
-    # Bind discovery timing
-    BIND_BACKOFF_MIN   =  3.0    # Min random response delay after a REQ (s)
-    BIND_BACKOFF_MAX   = 15.0    # Max random response delay after a REQ (s)
-    BIND_HEARTBEAT_S   = 3600.0  # Quiet heartbeat interval once peers known (s)
-    BIND_RESP_WINDOW_S = 60.0    # Time to collect responses per REQ attempt (s)
-    BIND_MAX_RETRIES   = 3       # REQ attempts before falling back to heartbeat
+    BIND_BACKOFF_MIN   =  3.0
+    BIND_BACKOFF_MAX   = 15.0
+    BIND_HEARTBEAT_S   = 3600.0
+    BIND_RESP_WINDOW_S = 60.0
+    BIND_MAX_RETRIES   = 3
 
-    # RNS header byte bit layout (confirmed against RNS/Packet.py unpack()):
-    #   bit  7   : IFAC flag         (0 = open, 1 = authenticated)
-    #   bit  6   : header type       (0 = HEADER_1, one 16B address;
-    #                                 1 = HEADER_2, transport_id + dest addr)
-    #                                 <- (flags & 0x40) >> 6
-    #                                 NOTE: header type only changes how many
-    #                                 address fields follow — it does NOT by
-    #                                 itself imply the packet must be broadcast.
-    #   bit  5   : context flag
-    #   bit  4   : propagation type  (0 = broadcast, 1 = transport)
-    #   bits 3-2 : destination type  <- (flags >> 2) & 0x03
-    #   bits 1-0 : packet type       <- flags & 0x03
-    #
-    # Destination hash length (RNS.Reticulum.TRUNCATED_HASHLENGTH // 8).
-    # For HEADER_1 packets: raw[2:2+DST_LEN] is the destination hash.
-    # For HEADER_2 packets: raw[2:2+DST_LEN] is the transport_id, and
-    # raw[2+DST_LEN:2+2*DST_LEN] is the destination hash.
     _RNS_DST_LEN = 16
-    #
-    # Packet type constants (bits 1-0):
     _RNS_PTYPE_DATA     = 0x00
     _RNS_PTYPE_ANNOUNCE = 0x01
     _RNS_PTYPE_LINK_REQ = 0x02
     _RNS_PTYPE_PROOF    = 0x03
-    #
-    # Destination type constants (bits 3-2):
+    
     _RNS_DTYPE_SINGLE = 0x00
     _RNS_DTYPE_GROUP  = 0x01
-    _RNS_DTYPE_PLAIN  = 0x02   # DATA + PLAIN = path request for an unknown dest
+    _RNS_DTYPE_PLAIN  = 0x02
     _RNS_DTYPE_LINK   = 0x03
 
-    # Maximum entries in _rns_to_mc_map before the oldest half is pruned
     _RNS_MAP_MAX = 512
+    
+    # Time window (seconds) to block processing duplicate packets that were fully reassembled.
+    DEDUPLICATION_TTL_S = 30.0
 
     # -------------------------------------------------------------------------
     # Constructor
@@ -472,109 +327,50 @@ class MeshCore_Dynamic_Interface(Interface):
         # --- Channel identity ----------------------------------------------
         self.channel_idx        = int(str(cfg.get("channel_idx", 0)).strip())
         self.channel_name       = cfg.get("channel_name", "RNSTunnel")
-        # channel_secret must be a 32-char hex string (128-bit key).
-        # Change this value — do not use the placeholder default in production.
         self.channel_secret_hex = cfg.get("channel_secret",
                                           "00000000000000000000000000000000")
 
         # --- Optional radio parameter overrides ----------------------------
-        # If all four are non-zero, the radio parameters are pushed to the
-        # MeshCore node at startup.  Leave at 0 to use the node's stored config.
         self.radio_freq = float(cfg.get("freq", 0))
         self.radio_bw   = float(cfg.get("bw",   0))
         self.radio_sf   = int(cfg.get("sf",     0))
         self.radio_cr   = int(cfg.get("cr",     0))
 
         # --- Protocol tuning -----------------------------------------------
-        # payload_size: raw bytes per fragment before base64 encoding.
-        # Default 64 → ~94-char encoded strings.  See module docstring for the
-        # sizing formula.  Setting this too high causes silent firmware
-        # truncation and broken base64 on the receiving end.
         self.payload_size = int(cfg.get("payload_size", 64))
-
-        # fragment_delay: inter-fragment pause for channel (broadcast) mode.
-        # LoRa is half-duplex shared media; 2.5 s gives the air time to clear
-        # between fragments and allows other nodes to interleave transmissions.
         self.fragment_delay_s = float(cfg.get("fragment_delay", 2.5))
 
-        # direct_frag_delay: inter-fragment pause for unicast direct messages.
-        # MeshCore firmware provides ACK and retry for direct messages at the
-        # link layer, so a shorter delay is safe and improves perceived latency.
         raw_dfd = cfg.get("direct_frag_delay", None)
         self.direct_frag_delay_s = float(raw_dfd) if raw_dfd is not None else 0.5
 
-        self.fragment_timeout_s = float(cfg.get("fragment_timeout", 3600))
+        # Default adjusted to 300s (5 minutes) for high-latency meshes
+        self.fragment_timeout_s = float(cfg.get("fragment_timeout", 300.0))
         self.rate_limit_bps     = int(cfg.get("rate_limit", 0))
 
-        # outgoing_announce_rate: minimum seconds between forwarding announces
-        # for any single RNS destination out through this interface.  Acts as a
-        # per-destination throttle independent of RNS's own announce_cap and
-        # announce_rate_target mechanisms.  Set to 0 to disable.
         self._announce_rate_s = float(cfg.get("outgoing_announce_rate", 600))
-
-        # outgoing_path_req_rate: minimum seconds between forwarding path
-        # requests (DATA + PLAIN destination) for any single destination.
-        # AP mode does not suppress path requests, only announce re-broadcasting.
-        # When a node goes offline, the wider mesh will continue sending path
-        # requests for it at the full RNS retry rate; without this limiter those
-        # requests pass straight through AP mode onto the LoRa channel.
-        # Set to 0 to disable.  Default 1800 s (30 min).
         self._path_req_rate_s = float(cfg.get("outgoing_path_req_rate", 1800))
 
         # --- Routing capability --------------------------------------------
-        # can_route: set to 'no' on edge/leaf nodes that have no upstream
-        # connectivity beyond the local MeshCore channel.  Advertised in every
-        # RNSBIND / RNSBIND_REQ so peers know not to use this node as a transit
-        # gateway.  Does not affect per-packet delivery decisions; see the
-        # CAPABILITY FIELD section in the module docstring.
         self.can_route = (
             cfg.get("can_route", "yes").lower() not in ("no", "false", "0")
         )
 
-        # allow_direct: enable unicast direct message delivery to known peers
-        # when a route has been learned via _rns_to_mc_map.
         self.allow_direct = (
             cfg.get("allow_direct", "yes").lower() not in ("no", "false", "0")
         )
 
-        # peer_ttl: seconds of silence before a peer entry is removed.
-        # Use a value that matches the expected maximum offline window for the
-        # devices on the channel (e.g. 7200 s for intermittently-connected
-        # mobile devices; 86400 s for fixed infrastructure nodes).
         self.peer_ttl_s = float(cfg.get("peer_ttl", 86400))
-
-        # --- Delay tolerance / RNS timing model -----------------------------
-        # bitrate: the ONE value RNS uses to compute how patient it is with
-        # this interface. It directly drives (see RNS/Transport.py):
-        #   first_hop_timeout()        = MTU * (8/bitrate) + DEFAULT_PER_HOP_TIMEOUT
-        #   extra_link_proof_timeout() = MTU * (8/bitrate)
-        # ...which feed into link establishment timeout, path request
-        # timeout, and how long RNS/LXMF wait for a PROOF before giving up
-        # and retrying. If this is never set, RNS falls back to a generic
-        # hardware-speed guess — nowhere close to real MeshCore LoRa airtime,
-        # and with NO allowance for a repeater's flood-routing jitter window
-        # sitting between two direct neighbors. That mismatch is what was
-        # causing RNS/LXMF to declare "failed" and start a fresh retry cycle
-        # while a fragment was still legitimately in flight.
-        #
-        # Set this to a conservative *effective* throughput: real LoRa
-        # airtime at your configured SF/BW, further derated for the repeater
-        # rebroadcasting your traffic and contending for the same channel.
-        # Default of 300 bps is deliberately pessimistic (typical raw LoRa
-        # airtime at moderate SF is faster than this) to bake in headroom for
-        # repeater jitter and shared-channel contention; tighten it once you
-        # have real RTT data from rnstatus/rnprobe on a busy channel.
         self.bitrate = int(cfg.get("bitrate", 300))
-
-        # --- Debug verbosity -----------------------------------------------
         self.debug_level = cfg.get("debug_level", "info").lower()
 
-        # --- Internal async state ------------------------------------------
+        # --- Internal async / threading state ------------------------------
         self._mc          = None
         self._EventType   = None
         self._loop        = None
         self._loop_thread = None
-        self._outqueue    = None  # Created inside the async loop thread
+        
+        # Thread-safe queue used to decouple synchronous execution from the worker loop
+        self._outqueue    = queue.Queue(maxsize=self.OUTQUEUE_MAXSIZE)
 
         self._own_node_name = ""
         self._own_mc_key    = ""
@@ -582,31 +378,14 @@ class MeshCore_Dynamic_Interface(Interface):
         self._pkt_id      = 0
         self._pkt_id_lock = threading.Lock()
 
-        # Fragment reassembly buffers keyed by (sender_name, pkt_id)
-        self._assembly      = {}   # key -> {frag_idx: bytes}
-        self._assembly_meta = {}   # key -> (frag_total, arrival_timestamp)
+        self._assembly      = {}   
+        self._assembly_meta = {}   
         self._asm_lock      = threading.Lock()
 
-        # Packet deduplication cache (LRU, capped at 512 entries)
-        self._seen_pkts = OrderedDict()  # (sender, pkt_id) -> seen_timestamp
+        # Sliding time-window cache: (sender, pkt_id) -> expiration_monotonic_timestamp
+        self._seen_pkts = {}  
         self._seen_lock = threading.Lock()
 
-        # Peer resolution tables — all guarded by _peer_lock:
-        #
-        #   _peer_table    : node_name        -> mc_pubkey_hex
-        #   _reverse_peers : mc_pubkey_hex    -> node_name
-        #                    (also stores prefix-length variants for fuzzy lookup)
-        #   _peer_last_seen: node_name        -> last-heard monotonic timestamp
-        #   _peer_caps     : node_name        -> bool (True = can route upstream)
-        #                    Populated from the RNSBIND capability field.
-        #                    Defaults to True for peers using the old wire format.
-        #                    Informational only — not consulted for packet routing.
-        #   _rns_to_mc_map : rns_token(bytes) -> mc_pubkey_hex
-        #                    rns_token = header-type-aware destination-hash
-        #                    field (16 bytes; see _extract_rns_token) of a
-        #                    received RNS packet; correlates the RNS source
-        #                    identifier with the MeshCore hardware key for
-        #                    unicast direct delivery.
         self._peer_table     = {}
         self._reverse_peers  = {}
         self._peer_last_seen = {}
@@ -614,21 +393,17 @@ class MeshCore_Dynamic_Interface(Interface):
         self._rns_to_mc_map  = {}
         self._peer_lock      = threading.Lock()
 
-        # Per-destination outgoing rate limit timestamps
-        self._announce_sent_times = {}   # dest_id(bytes) -> monotonic timestamp
+        self._announce_sent_times = {}   
         self._announce_sent_lock  = threading.Lock()
-        self._path_req_sent_times = {}   # dest_id(bytes) -> monotonic timestamp
+        self._path_req_sent_times = {}   
         self._path_req_sent_lock  = threading.Lock()
 
-        self._has_direct_api    = False  # Does this MC build support send_msg?
-        self._pending_resp_task = None   # At most one RNSBIND response in-flight
+        self._has_direct_api    = False  
+        self._pending_resp_task = None  
 
         self._setup_done = threading.Event()
         self._load_meshcore_or_panic()
 
-        # Spawn an isolated asyncio event loop in a daemon thread so the
-        # MeshCore async API does not interfere with any event loop the host
-        # application may be running.
         self._loop = asyncio.new_event_loop()
         self._loop_thread = threading.Thread(
             target=self._run_loop, daemon=True,
@@ -685,13 +460,10 @@ class MeshCore_Dynamic_Interface(Interface):
                 f"meshcore library not found — cannot continue.",
                 RNS.LOG_CRITICAL
             )
-            RNS.panic()
+            self.owner.panic()
 
     def _run_loop(self):
-        """Entry point for the dedicated asyncio worker thread."""
         asyncio.set_event_loop(self._loop)
-        # asyncio.Queue must be created on the thread that owns the loop.
-        self._outqueue = asyncio.Queue(maxsize=self.OUTQUEUE_MAXSIZE)
         try:
             self._loop.run_forever()
         except Exception as exc:
@@ -701,11 +473,9 @@ class MeshCore_Dynamic_Interface(Interface):
             )
 
     async def _async_setup(self):
-        """Initialise the MeshCore driver connection and start background tasks."""
         MeshCore = self._mc_module.MeshCore
         ET       = self._EventType
 
-        # --- Driver init ---------------------------------------------------
         try:
             if self.transport == "serial":
                 self._mc = await MeshCore.create_serial(self.port, self.baudrate)
@@ -726,7 +496,6 @@ class MeshCore_Dynamic_Interface(Interface):
             )
             return
 
-        # --- Identity fetch ------------------------------------------------
         try:
             result = await self._mc.commands.send_appstart()
             if result.type == ET.SELF_INFO:
@@ -747,7 +516,6 @@ class MeshCore_Dynamic_Interface(Interface):
                 f"Identity fetch failed: {exc}", RNS.LOG_WARNING
             )
 
-        # --- Optional radio parameter override -----------------------------
         if self.radio_freq and self.radio_bw and self.radio_sf and self.radio_cr:
             try:
                 await self._mc.commands.set_radio(
@@ -756,7 +524,6 @@ class MeshCore_Dynamic_Interface(Interface):
             except Exception:
                 pass
 
-        # --- Channel init --------------------------------------------------
         try:
             secret_bytes = bytes.fromhex(self.channel_secret_hex)
             await self._mc.commands.set_channel(
@@ -768,13 +535,9 @@ class MeshCore_Dynamic_Interface(Interface):
                 f"Channel init error: {exc}", RNS.LOG_WARNING
             )
 
-        # --- Direct message API detection ----------------------------------
         if self.allow_direct:
             self._has_direct_api = hasattr(self._mc.commands, "send_msg")
 
-        # --- Event subscriptions -------------------------------------------
-        # Callbacks are synchronous shims that schedule coroutines on the
-        # dedicated event loop without blocking the MeshCore event thread.
         self._mc.subscribe(
             ET.CHANNEL_MSG_RECV,
             lambda e: asyncio.run_coroutine_threadsafe(
@@ -782,7 +545,6 @@ class MeshCore_Dynamic_Interface(Interface):
             )
         )
 
-        # The direct-message receive event name varies across library versions.
         _direct_recv_et = None
         for _name in ("CONTACT_MSG_RECV", "DIRECT_MSG_RECV", "PRIVATE_MSG_RECV",
                       "MSG_RECV", "PRIV_MSG_RECV"):
@@ -797,10 +559,8 @@ class MeshCore_Dynamic_Interface(Interface):
                 break
 
         if _direct_recv_et is None:
-            # No supported direct-message event found; disable unicast routing.
             self._has_direct_api = False
 
-        # ACK events are informational; reserved for future reliability work.
         for _name in ("ACK", "MSG_ACKED", "MESSAGE_ACKED", "CHAN_ACK"):
             _ack_et = getattr(ET, _name, None)
             if _ack_et is not None:
@@ -814,7 +574,6 @@ class MeshCore_Dynamic_Interface(Interface):
 
         await self._mc.start_auto_message_fetching()
 
-        # --- Background coroutines -----------------------------------------
         asyncio.create_task(self._cleanup_loop())
         asyncio.create_task(self._bind_discovery_loop())
         asyncio.create_task(self._async_outgoing_worker())
@@ -827,26 +586,10 @@ class MeshCore_Dynamic_Interface(Interface):
     # -------------------------------------------------------------------------
 
     def _own_capability(self) -> str:
-        """Return the capability token for this node."""
         return self.CAPABILITY_ROUTER if self.can_route else self.CAPABILITY_EDGE
 
     async def _bind_discovery_loop(self):
-        """
-        Demand-driven peer discovery via RNSBIND_REQ / RNSBIND exchange.
-
-        Behaviour:
-          - No peers known → send RNSBIND_REQ:<pubkey>:<cap> and wait
-            BIND_RESP_WINDOW_S for responses.  Retry up to BIND_MAX_RETRIES.
-          - Peers known (or retries exhausted) → send a quiet RNSBIND:<pubkey>:<cap>
-            heartbeat every BIND_HEARTBEAT_S so that newly-arriving nodes can
-            learn this node's key and capability without soliciting a response
-            storm from existing peers.
-
-        The capability field is included in both REQ and heartbeat messages so
-        that peers learn routing capability as early as possible — including from
-        the initial solicitation before any response has arrived.
-        """
-        await asyncio.sleep(5)  # Let the MeshCore connection settle
+        await asyncio.sleep(5)  # Let connection settle
         retries = 0
 
         while True:
@@ -874,8 +617,6 @@ class MeshCore_Dynamic_Interface(Interface):
                 await asyncio.sleep(self.BIND_RESP_WINDOW_S)
 
             else:
-                # Either we have peers, or retries are exhausted.
-                # Reset counter and shift to the long quiet heartbeat interval.
                 retries = 0
                 if self.online and self._own_mc_key:
                     try:
@@ -889,18 +630,6 @@ class MeshCore_Dynamic_Interface(Interface):
                 await asyncio.sleep(self.BIND_HEARTBEAT_S)
 
     async def _delayed_bind_response(self):
-        """
-        Respond to a RNSBIND_REQ after a random backoff delay.
-
-        The random delay (BIND_BACKOFF_MIN to BIND_BACKOFF_MAX seconds)
-        distributes responses in time when multiple nodes hear the same request,
-        preventing a simultaneous response burst on the shared LoRa channel.
-        This mirrors RFC 2236 (IGMP) report suppression: if another node
-        responds first, all overhearing nodes passively learn from that response.
-
-        The capability field is included so the requester immediately knows
-        whether this node can carry upstream traffic.
-        """
         delay = random.uniform(self.BIND_BACKOFF_MIN, self.BIND_BACKOFF_MAX)
         await asyncio.sleep(delay)
         if not self.online or not self._own_mc_key:
@@ -924,18 +653,8 @@ class MeshCore_Dynamic_Interface(Interface):
     # -------------------------------------------------------------------------
 
     async def _cleanup_loop(self):
-        """
-        Periodic housekeeping to prevent unbounded memory growth.
-
-        Cleans up:
-          - Stale fragment reassembly buffers (older than fragment_timeout_s)
-          - Expired peers (silent for longer than peer_ttl_s), including their
-            capability flags and associated RNS→MC route map entries
-          - Old outgoing announce rate timestamps (older than 2× rate window)
-          - Old outgoing path request rate timestamps (older than 2× rate window)
-        """
         while True:
-            await asyncio.sleep(60)
+            await asyncio.sleep(30)  
             now = time.monotonic()
 
             # --- Stale fragment buffers ------------------------------------
@@ -948,6 +667,12 @@ class MeshCore_Dynamic_Interface(Interface):
                 for k in stale:
                     del self._assembly[k]
                     del self._assembly_meta[k]
+
+            # --- Expired sliding window deduplication records --------------
+            with self._seen_lock:
+                expired_seen = [k for k, exp in self._seen_pkts.items() if now >= exp]
+                for k in expired_seen:
+                    del self._seen_pkts[k]
 
             # --- Expired peers ---------------------------------------------
             peer_deadline = now - self.peer_ttl_s
@@ -964,7 +689,6 @@ class MeshCore_Dynamic_Interface(Interface):
                         self._reverse_peers.pop(mc_key, None)
                         for pfx_len in (8, 12, 16, 24):
                             self._reverse_peers.pop(mc_key[:pfx_len], None)
-                        # Also remove any RNS→MC route entries for this peer
                         stale_tokens = [
                             t for t, k in self._rns_to_mc_map.items()
                             if k == mc_key
@@ -1005,25 +729,12 @@ class MeshCore_Dynamic_Interface(Interface):
     # -------------------------------------------------------------------------
 
     async def _on_channel_msg(self, event):
-        """
-        Dispatched for every message received on the shared MeshCore channel.
-
-        Checks for bind protocol messages first (RNSBIND_REQ or RNSBIND),
-        then falls through to RNS tunnel data processing.
-
-        Prefix detection note: RNSBIND: is a literal substring of RNSBIND_REQ:,
-        so both text.find() calls may land on the same index for a REQ message.
-        The 'REQ takes precedence on tie' logic in the eff_bind block ensures
-        correct dispatch, and _handle_bind re-disambiguates using the same
-        comparison to extract the pubkey at the correct prefix length.
-        """
         text = event.payload.get("text", "")
 
-        rns_idx  = text.find(self.MSG_PREFIX)       # "RNS:"
-        bind_idx = text.find(self.BIND_PREFIX)      # "RNSBIND:"
-        req_idx  = text.find(self.BIND_REQ_PREFIX)  # "RNSBIND_REQ:"
+        rns_idx  = text.find(self.MSG_PREFIX)      
+        bind_idx = text.find(self.BIND_PREFIX)     
+        req_idx  = text.find(self.BIND_REQ_PREFIX) 
 
-        # Identify the earliest bind-protocol token; REQ takes precedence on tie.
         eff_bind = -1
         if req_idx != -1 and (bind_idx == -1 or req_idx <= bind_idx):
             eff_bind = req_idx
@@ -1039,8 +750,7 @@ class MeshCore_Dynamic_Interface(Interface):
             await self._process_tunnel_text(text[rns_idx:], sender, rx_mode="CHANNEL")
 
     async def _on_direct_msg(self, event):
-        """Handles incoming unicast direct messages from known MeshCore peers."""
-        payload    = event.payload
+        payload = event.payload
         sender_key = (
             payload.get("pubkey_prefix") or payload.get("sender_pubkey") or
             payload.get("pubkey")        or payload.get("from_pubkey") or ""
@@ -1052,27 +762,9 @@ class MeshCore_Dynamic_Interface(Interface):
         await self._process_tunnel_text(text, sender_id, rx_mode="DIRECT")
 
     async def _on_msg_ack(self, event):
-        """ACK receipt hook — reserved for future retry/reliability tracking."""
         pass
 
     async def _handle_bind(self, text: str, bind_idx: int, req_idx: int = -1):
-        """
-        Process a RNSBIND_REQ (discovery request) or RNSBIND (response/heartbeat).
-
-        Wire format:  <SenderName>: RNSBIND[_REQ]:<pubkey>[:<cap>]
-
-          <pubkey>  MeshCore hex public key of the sender.
-          <cap>     Optional capability token: R (router) or E (edge).
-                    Absent in messages from nodes using older firmware versions;
-                    treated as R (can route) for backward compatibility.
-
-        Both message types trigger identical peer table updates — every
-        overhearing node learns the sender's identity and capability (passive
-        L2 learning).  A RNSBIND_REQ additionally schedules a delayed response.
-        """
-        # Disambiguate REQ vs plain response.
-        # (req_idx <= bind_idx handles the equal-index case caused by RNSBIND:
-        # being a substring of RNSBIND_REQ:)
         is_req  = (req_idx != -1 and (bind_idx == -1 or req_idx <= bind_idx))
         prefix  = self.BIND_REQ_PREFIX if is_req else self.BIND_PREFIX
         pfx_idx = req_idx              if is_req else bind_idx
@@ -1083,15 +775,12 @@ class MeshCore_Dynamic_Interface(Interface):
         if not sender_name or not raw_value or sender_name == self._own_node_name:
             return
 
-        # Parse the optional capability suffix: "PUBKEYHEX:R" or "PUBKEYHEX:E".
-        # rsplit with maxsplit=1 is robust against any future pubkey format that
-        # might contain a colon (current hex pubkeys do not).
         if ":" in raw_value:
             mc_pubkey, cap_str = raw_value.rsplit(":", 1)
             peer_can_route = (cap_str.strip().upper() != self.CAPABILITY_EDGE)
         else:
             mc_pubkey      = raw_value
-            peer_can_route = True   # No capability field — backward-compatible default
+            peer_can_route = True  
 
         mc_pubkey = mc_pubkey.strip()
         if not mc_pubkey:
@@ -1121,7 +810,6 @@ class MeshCore_Dynamic_Interface(Interface):
                 RNS.LOG_INFO
             )
 
-        # Schedule a delayed response to a REQ — at most one pending at a time.
         if is_req and self._own_mc_key:
             if self._pending_resp_task is None or self._pending_resp_task.done():
                 self._pending_resp_task = asyncio.create_task(
@@ -1129,7 +817,6 @@ class MeshCore_Dynamic_Interface(Interface):
                 )
 
     def _resolve_sender_key(self, key_str: str) -> str:
-        """Map a MeshCore pubkey or prefix back to a human-readable node name."""
         if not key_str:
             return key_str
         with self._peer_lock:
@@ -1142,32 +829,9 @@ class MeshCore_Dynamic_Interface(Interface):
         return key_str
 
     async def _process_tunnel_text(self, text: str, sender: str = "", rx_mode: str = "UNKNOWN"):
-        """
-        Decode a base64-encoded fragment and reassemble into a full RNS packet.
-
-        Dynamic L2/L3 link learning
-        ───────────────────────────
-        Once a packet is fully reassembled, its header-type-aware destination-
-        hash field is extracted as an RNS routing token (see
-        _extract_rns_token).  This window is consistent across the announce →
-        path-reply → data packet sequence for a given RNS destination, and
-        transparently also covers link_id once an RNS Link is established
-        (link_id occupies the same wire position as the destination hash).  If the sender is a
-        known MeshCore peer, the token is stored in _rns_to_mc_map.  Subsequent
-        outgoing packets whose next-hop token matches will be sent via unicast
-        direct message instead of channel broadcast, reducing channel load.
-
-        Entries in _rns_to_mc_map represent paths that have demonstrably carried
-        traffic, including paths that transit through an edge node to reach a
-        downstream client (e.g. a phone connected to a hotspot on the edge node).
-        These entries are trusted unconditionally for delivery; the peer capability
-        flag is not consulted here.
-        """
-        # Echo suppression: MeshCore delivers our own channel messages back to us.
         if sender and sender == self._own_node_name:
             return
 
-        # Restore base64 padding stripped during encode, then decode.
         b64 = text[len(self.MSG_PREFIX):].strip()
         b64 += "=" * (-len(b64) % 4)
         try:
@@ -1178,28 +842,29 @@ class MeshCore_Dynamic_Interface(Interface):
         if len(raw) < self.HEADER_SIZE:
             return
 
-        frag_idx   = raw[0]
-        pkt_id     = raw[1]
-        frag_total = raw[2]
+        # Header unpacked big-endian matching structural change (1B index, 4B packet ID, 1B total fragments)
+        frag_idx, pkt_id, frag_total = struct.unpack(">BIB", raw[:6])
         payload    = raw[self.HEADER_SIZE:]
 
         if frag_total == 0 or frag_idx >= frag_total:
             return
 
         key = (sender, pkt_id)
+        now = time.monotonic()
 
-        # Deduplication: return early if this (sender, pkt_id) was already
-        # fully delivered.  Move to end on hit for LRU ordering.
+        # Sliding time-window deduplication check
         with self._seen_lock:
             if key in self._seen_pkts:
-                self._seen_pkts.move_to_end(key)
-                return
+                if now < self._seen_pkts[key]:
+                    return  
+                else:
+                    del self._seen_pkts[key]
 
         # Fragment reassembly
         with self._asm_lock:
             if key not in self._assembly:
                 self._assembly[key]      = {}
-                self._assembly_meta[key] = (frag_total, time.monotonic())
+                self._assembly_meta[key] = (frag_total, now)
 
             if frag_idx in self._assembly[key]:
                 return
@@ -1207,9 +872,8 @@ class MeshCore_Dynamic_Interface(Interface):
             self._assembly[key][frag_idx] = payload
 
             if len(self._assembly[key]) < self._assembly_meta[key][0]:
-                return  # Still waiting for remaining fragments
+                return  
 
-            # All fragments received — reassemble in index order
             try:
                 expected    = self._assembly_meta[key][0]
                 full_packet = b"".join(
@@ -1222,21 +886,13 @@ class MeshCore_Dynamic_Interface(Interface):
                 self._assembly_meta.pop(key, None)
                 return
 
-        # Mark as seen; prune cache if over the 512-entry LRU cap.
+        # Mark as completely reassembled inside sliding time window
         with self._seen_lock:
-            self._seen_pkts[key] = time.monotonic()
-            if len(self._seen_pkts) > 512:
-                while len(self._seen_pkts) > 256:
-                    self._seen_pkts.popitem(last=False)
+            self._seen_pkts[key] = now + self.DEDUPLICATION_TTL_S
 
         if not full_packet:
             return
 
-        # Dynamic L2/L3 link learning: extract the destination-hash field of
-        # the reassembled packet (header-type aware — see _extract_rns_token)
-        # against the MeshCore sender key so that future outbound packets for
-        # this destination (or, once a link is established, this link_id) can
-        # be sent unicast.
         rns_token = self._extract_rns_token(full_packet)
         if rns_token is not None and sender:
             with self._peer_lock:
@@ -1244,7 +900,6 @@ class MeshCore_Dynamic_Interface(Interface):
                 if mc_key:
                     if rns_token not in self._rns_to_mc_map:
                         self._rns_to_mc_map[rns_token] = mc_key
-                        # Prune oldest half if the map exceeds the size cap
                         if len(self._rns_to_mc_map) > self._RNS_MAP_MAX:
                             trim = list(self._rns_to_mc_map.keys())[
                                 : self._RNS_MAP_MAX // 2
@@ -1259,14 +914,6 @@ class MeshCore_Dynamic_Interface(Interface):
                                 RNS.LOG_DEBUG
                             )
 
-                    # Proactive link_id binding: if this is a LINK_REQUEST
-                    # packet, derive the link_id it will be answered under and
-                    # bind it to the same peer right now. Without this, the
-                    # accepting side's very first outbound packet on the new
-                    # link (its LINK PROOF, addressed to link_id) would always
-                    # miss the route cache and fall back to broadcast, since
-                    # link_id never appears as an inbound token until after
-                    # the link is already established.
                     if full_packet[0] & 0x03 == self._RNS_PTYPE_LINK_REQ:
                         link_id = self._link_id_from_lr_packet(full_packet)
                         if link_id is not None and link_id not in self._rns_to_mc_map:
@@ -1279,12 +926,11 @@ class MeshCore_Dynamic_Interface(Interface):
                                     RNS.LOG_DEBUG
                                 )
         if full_packet:
-            # Extract RNS packet type (bits 1-0 of the header byte)
             ptype = full_packet[0] & 0x03
             ptype_str = {
-                0x00: "DATA", 
-                0x01: "ANNOUNCE", 
-                0x02: "LINK_REQ", 
+                0x00: "DATA",
+                0x01: "ANNOUNCE",
+                0x02: "LINK_REQ",
                 0x03: "PROOF"
             }.get(ptype, "UNKNOWN")
             
@@ -1306,29 +952,11 @@ class MeshCore_Dynamic_Interface(Interface):
     # -------------------------------------------------------------------------
 
     def _is_broadcast_packet(self, data: bytes) -> bool:
-        """
-        Return True if this RNS packet must be sent via channel broadcast rather
-        than unicast direct message.
-
-        Only two conditions mandate broadcast:
-          - ANNOUNCE packets — all nodes need them for path discovery.
-          - DATA packets addressed to a PLAIN destination (path requests) —
-            per the RNS spec, plain destinations are only reachable directly
-            and are never transported over multiple hops, so a cached "next
-            hop" for one is meaningless and potentially wrong (a stale/
-            colliding token could otherwise misroute a path request to the
-            wrong unicast peer instead of broadcasting it).
-
-        Header type (bit 6) does NOT determine broadcast vs. unicast — it only
-        indicates whether a transport_id field precedes the destination hash.
-        A HEADER_2 (in-transit) packet can be perfectly valid to unicast to a
-        known next hop, same as a HEADER_1 packet.
-        """
         if len(data) < 1:
             return True
         flags     = data[0]
-        ptype     = flags & 0x03          # bits 1-0 = packet type
-        dest_type = (flags >> 2) & 0x03   # bits 3-2 = destination type
+        ptype     = flags & 0x03         
+        dest_type = (flags >> 2) & 0x03  
         if ptype == self._RNS_PTYPE_ANNOUNCE:
             return True
         if ptype == self._RNS_PTYPE_DATA and dest_type == self._RNS_DTYPE_PLAIN:
@@ -1336,64 +964,22 @@ class MeshCore_Dynamic_Interface(Interface):
         return False
 
     def _extract_rns_token(self, data: bytes):
-        """
-        Extract the 16-byte RNS destination-hash field from a packet, correctly
-        accounting for header type.
-
-        raw[0]      = flags
-        raw[1]      = hops                     (volatile — changes every hop,
-                                                  must NEVER be included in the
-                                                  token)
-        HEADER_1:  raw[2 : 2+DST_LEN]           = destination_hash
-        HEADER_2:  raw[2 : 2+DST_LEN]           = transport_id
-                   raw[2+DST_LEN : 2+2*DST_LEN] = destination_hash
-
-        For RNS Links (NomadNet, LXMF sync, group chat), once a link is
-        established this same field carries the link's link_id instead of the
-        original destination hash — that's expected and handled transparently,
-        since link_id is just another 16-byte value that lands in the same
-        wire position.
-
-        Returns None if the packet is too short to contain the field.
-        """
         if len(data) < 2:
             return None
         header_type = (data[0] & 0x40) >> 6
         DST_LEN = self._RNS_DST_LEN
-        if header_type == 1:  # HEADER_2 — transport_id then destination_hash
+        if header_type == 1: 
             end = 2 + 2 * DST_LEN
             if len(data) < end:
                 return None
             return bytes(data[2 + DST_LEN:end])
-        else:  # HEADER_1
+        else: 
             end = 2 + DST_LEN
             if len(data) < end:
                 return None
             return bytes(data[2:end])
 
     def _link_id_from_lr_packet(self, raw: bytes):
-        """
-        Replicate RNS's own link_id derivation (Packet.get_hashable_part() +
-        truncated SHA-256) so that when we observe an inbound LINK_REQUEST
-        packet, we can proactively bind the link_id it will be answered under
-        to the MeshCore peer that delivered it — *before* we ever need to send
-        anything addressed to that link_id ourselves.
-
-        This closes the gap that a passive "learn from what I've already seen"
-        token map cannot: the accepting side of a link must send its LINK
-        PROOF addressed to link_id as its very first outbound packet on that
-        link, without ever having seen link_id appear as an inbound token.
-
-            hashable_part = bytes([raw[0] & 0b00001111])   # dest_type + packet_type only
-            hashable_part += raw[2:]      if HEADER_1
-                           += raw[2+DST_LEN:] if HEADER_2
-            link_id = sha256(hashable_part)[:DST_LEN]
-
-        NOTE: this mirrors RNS/Packet.py::get_hashable_part() and assumes
-        standard RNS.Identity.truncated_hash() semantics (SHA-256, truncated
-        to DST_LEN bytes). Verify against your local Identity.py if RNS ever
-        changes this — it is not re-derived from that file here.
-        """
         if len(raw) < 2:
             return None
         DST_LEN = self._RNS_DST_LEN
@@ -1408,53 +994,19 @@ class MeshCore_Dynamic_Interface(Interface):
         return hashlib.sha256(hashable).digest()[:DST_LEN]
 
     def process_outgoing(self, data):
-        """Compatibility shim — RNS may call either spelling."""
         return self.processOutgoing(data)
 
     def processOutgoing(self, data):
-        """
-        Fragment and enqueue an outbound RNS packet.
-
-        Announce rate limiting  (outgoing_announce_rate, default 600 s)
-        ─────────────────────────────────────────────────────────────────
-        Suppresses re-forwarding of ANNOUNCE packets for any single destination
-        seen within the rate window.  Independent of RNS's own announce_cap and
-        announce_rate_target mechanisms, providing an additional layer of
-        protection on constrained radio links.
-
-        Path request rate limiting  (outgoing_path_req_rate, default 1800 s)
-        ─────────────────────────────────────────────────────────────────────
-        AP mode only suppresses ANNOUNCE re-broadcasting.  DATA+PLAIN packets
-        (path requests, header byte 0x08) pass through AP mode unchecked.
-        When a node goes offline after having been reachable, remote nodes on
-        the wider mesh generate path requests for it continuously at the full
-        RNS retry rate.  This limiter throttles how often any single destination
-        is searched for via the LoRa channel.
-
-        Routing decision
-        ────────────────
-        Broadcast packets (announces, link requests) always go to the shared
-        channel.  For all other traffic, if a unicast route is cached in
-        _rns_to_mc_map for the next-hop RNS token, the packet is sent via
-        MeshCore direct message.  The cached route is trusted unconditionally —
-        it exists only because traffic has demonstrably flowed over it, including
-        traffic that transits through an edge node to reach a downstream client.
-        """
         if not self.online:
             return
 
-        # Extract packet and destination type from the header byte for all
-        # rate-limiting checks that follow.
         hdr_byte  = data[0] if data else 0
-        ptype     = hdr_byte & 0x03          # bits 1-0 = packet type
-        dest_type = (hdr_byte >> 2) & 0x03   # bits 3-2 = destination type
+        ptype     = hdr_byte & 0x03         
+        dest_type = (hdr_byte >> 2) & 0x03  
 
         # Per-destination outgoing announce rate limiter
         if self._announce_rate_s > 0 and len(data) >= 12:
             if ptype == self._RNS_PTYPE_ANNOUNCE:
-                # Bytes 2:12 approximate the destination hash location.
-                # False collisions between destinations are harmless — they
-                # share a rate-limit bucket, nothing more.
                 dest_id = bytes(data[2:12])
                 now     = time.monotonic()
                 with self._announce_sent_lock:
@@ -1474,12 +1026,11 @@ class MeshCore_Dynamic_Interface(Interface):
 
         with self._pkt_id_lock:
             pkt_id       = self._pkt_id
-            self._pkt_id = (self._pkt_id + 1) & 0xFF
+            self._pkt_id = (self._pkt_id + 1) & 0xFFFFFFFF  # 32-bit bound integer tracking
 
         handler   = _PacketHandler(data, pkt_id, self.payload_size)
         broadcast = self._is_broadcast_packet(data)
 
-        # Resolve a unicast next-hop from the cached RNS→MC route map.
         target_key = None
         channel_reason = ""
 
@@ -1497,7 +1048,6 @@ class MeshCore_Dynamic_Interface(Interface):
                 if not target_key:
                     channel_reason = f"No direct route bound for RNS token {next_hop_token.hex()[:8]}"
 
-        # Apply routing decision and log the result
         if channel_reason:
             RNS.log(
                 f"MeshCore_Dynamic_Interface [{self.name}]: "
@@ -1515,48 +1065,26 @@ class MeshCore_Dynamic_Interface(Interface):
             
         for frag_str in handler.fragments:
             for mode, target in route:
-                self._loop.call_soon_threadsafe(
-                    self._inject_frag, (mode, target, frag_str)
-                )
+                try:
+                    # Thread-safe blocking put handles backpressure cleanly
+                    self._outqueue.put((mode, target, frag_str), block=True, timeout=None)
+                except Exception:
+                    pass
 
         self.txb += len(data)
 
-    def _inject_frag(self, item):
-        """Thread-safe enqueue of a fragment tuple onto the async outqueue."""
-        try:
-            self._outqueue.put_nowait(item)
-        except asyncio.QueueFull:
-            pass
-
     async def _async_outgoing_worker(self):
         """
-        Dequeue and transmit fragment tuples, enforcing per-fragment delays.
-
-        Delay strategy:
-          channel mode   (fragment_delay_s, default 2.5 s)
-            Longer inter-fragment pause for broadcast on half-duplex shared
-            media.  Gives other nodes time to receive each fragment and allows
-            interleaving of traffic from different sources.
-
-          direct mode    (direct_frag_delay_s, default 0.5 s)
-            Shorter pause because MeshCore firmware handles ACK and retry for
-            direct messages at the link layer, improving session latency without
-            sacrificing delivery reliability.
-
-        If rate_limit_bps is configured, the actual delay is the greater of the
-        configured delay and the theoretical on-air transmission time.
+        Worker task pulling payload chunks from the thread-safe synchronized queue
+        using the event loop executor pool to preserve pure async interface execution.
         """
         while True:
-            item = await self._outqueue.get()
-
             if not self.online or self._mc is None:
                 await asyncio.sleep(0.5)
-                try:
-                    self._outqueue.put_nowait(item)
-                except asyncio.QueueFull:
-                    pass
                 continue
 
+            # Safe non-blocking cross-thread extraction via run_in_executor
+            item = await self._loop.run_in_executor(None, self._outqueue.get)
             mode, target, frag_str = item
 
             try:
@@ -1567,8 +1095,9 @@ class MeshCore_Dynamic_Interface(Interface):
             except Exception:
                 if mode == "direct":
                     try:
+                        # Fallback to channel if targeted routing exceptions happen mid-transit
                         self._outqueue.put_nowait(("channel", None, frag_str))
-                    except asyncio.QueueFull:
+                    except queue.Full:
                         pass
                 self._outqueue.task_done()
                 continue
@@ -1590,7 +1119,6 @@ class MeshCore_Dynamic_Interface(Interface):
     # -------------------------------------------------------------------------
 
     def processIncoming(self, data: bytes):
-        """Deliver a fully-reassembled RNS packet to the Reticulum stack."""
         if self.online and not self.detached:
             self.rxb += len(data)
             self.owner.inbound(data, self)
@@ -1599,5 +1127,4 @@ class MeshCore_Dynamic_Interface(Interface):
         return f"MeshCore_Dynamic_Interface[{self.name}]"
 
 
-# Required by the RNS custom interface loader
 interface_class = MeshCore_Dynamic_Interface
