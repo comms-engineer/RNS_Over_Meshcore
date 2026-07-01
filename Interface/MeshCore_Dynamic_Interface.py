@@ -7,56 +7,6 @@ demand-driven peer discovery and edge-node capability advertisement.  No static
 remote-node configuration is required.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-CHANGELOG (this revision)
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Audit fixes applied — see inline comments tagged [FIX n] at each site:
-
-  [FIX 1] Startup race between RNSBIND completion and inbound RNS announces.
-          Previously, _rns_to_mc_map was only populated when the sending
-          peer's MeshCore key was ALREADY known in _peer_table at the moment
-          a packet was reassembled. Since RNSBIND discovery runs on its own
-          schedule (5s settle + up to BIND_RESP_WINDOW_S per retry) and RNS
-          announces arrive independently (often within the first few seconds
-          of stack startup), any packet — including the propagation node's
-          initial announce — that arrived before RNSBIND completed was
-          silently dropped on the floor for routing purposes, and the
-          "if rns_token not in _rns_to_mc_map" guard prevented the entry from
-          ever being corrected later. A new map, _rns_to_sender_map, now
-          parks token -> node_name associations the instant a packet is
-          reassembled, regardless of whether the MeshCore key is known yet.
-          processOutgoing() resolves it retroactively once RNSBIND has
-          caught up, and promotes it into the fast-path map at that point.
-
-  [FIX 2] Outbound token extraction used two conditional shifts that did NOT
-          match the fixed, unconditional bytes[1:11] window used on the
-          inbound (learning) side. Any packet that tripped either shift
-          looked up a token that was never stored under that key, guaranteeing
-          a routing miss (silent fallback to channel). Both shifts are removed;
-          inbound and outbound now use the identical bytes[1:11] window.
-
-  [FIX 3] Map entries were never updated/refreshed once first written ("if
-          rns_token not in map" guard). A peer that changed its MeshCore key
-          (firmware reflash, factory reset) would leave stale routes pointing
-          at a key that no longer exists, with no recovery until peer_ttl
-          expired. The guard is removed — every successful reassembly now
-          refreshes the route.
-
-  [FIX 4] If no supported direct-message receive EventType name is found,
-          unicast routing is disabled silently (_has_direct_api = False) with
-          no diagnostic indicating *why*. A LOG_WARNING now fires, listing the
-          EventType names that were probed and the names actually available in
-          the installed meshcore library, so a library version mismatch is
-          immediately diagnosable instead of presenting as "direct never
-          works" with no further explanation.
-
-  [FIX 5] _async_outgoing_worker's offline-requeue path skipped
-          self._outqueue.task_done() before "continue", permanently inflating
-          asyncio.Queue's unfinished-task counter. Not currently load-bearing
-          (queue.join() isn't called anywhere), but it's a latent correctness
-          bug that will bite if queue draining/shutdown logic is added later.
-          task_done() is now called before every requeue.
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 WIRE FORMAT
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 Each RNS binary packet is split into payload-sized chunks.  Each chunk is
@@ -81,16 +31,6 @@ RNS HEADER BYTE BIT LAYOUT (single-header packet, bit 7 = 0)
   node that was recently reachable goes offline, remote nodes will generate a
   continuous stream of path requests that will pass straight through AP mode
   and onto the LoRa channel.  The outgoing_path_req_rate limiter handles this.
-
-  RNS TOKEN WINDOW (bytes 1:11 of a single-header packet)
-    For ANY single-header packet — ANNOUNCE or DATA — bytes 1 through 16 are
-    the destination hash. The first 10 bytes of that hash, data[1:11], are
-    used throughout this interface as a compact "RNS token" correlating an
-    announce with subsequent data traffic to the same destination. This
-    window is fixed and unconditional: it must be identical on both the
-    inbound learning path (_process_tunnel_text) and the outbound lookup path
-    (processOutgoing). See [FIX 2] above — a previous revision applied
-    conditional byte-shifts on the outbound side that broke this invariant.
 
 PAYLOAD SIZE
   MeshCore firmware silently truncates channel messages that exceed a hardware-
@@ -129,13 +69,6 @@ periodic push-based broadcasting, minimising channel airtime consumption.
      so a single discovery round passively populates all peer tables.
   5. Once peers are known, a quiet RNSBIND heartbeat is sent every
      BIND_HEARTBEAT_S (default 1 hour) — no response is solicited.
-
-  IMPORTANT TIMING NOTE (see [FIX 1]): RNSBIND discovery and RNS announce
-  reception are two independent, asynchronously-scheduled processes. There is
-  NO guarantee that this node's peer table is populated by the time the first
-  RNS announce from a given peer (e.g. a propagation node) arrives. The
-  _rns_to_sender_map mechanism exists specifically to bridge this gap without
-  dropping the routing opportunity.
 
 CAPABILITY FIELD
   The capability suffix ("R" = router, "E" = edge) is appended to every RNSBIND
@@ -397,6 +330,7 @@ import RNS
 from RNS.Interfaces.Interface import Interface
 import asyncio
 import base64
+import hashlib
 import random
 import threading
 import time
@@ -480,11 +414,24 @@ class MeshCore_Dynamic_Interface(Interface):
     BIND_RESP_WINDOW_S = 60.0    # Time to collect responses per REQ attempt (s)
     BIND_MAX_RETRIES   = 3       # REQ attempts before falling back to heartbeat
 
-    # RNS single-header byte bit layout:
-    #   bits 7-6 : header type     (0b10 = two-byte header; always broadcast)
-    #   bits 5-4 : transport flags
+    # RNS header byte bit layout (confirmed against RNS/Packet.py unpack()):
+    #   bit  7   : IFAC flag         (0 = open, 1 = authenticated)
+    #   bit  6   : header type       (0 = HEADER_1, one 16B address;
+    #                                 1 = HEADER_2, transport_id + dest addr)
+    #                                 <- (flags & 0x40) >> 6
+    #                                 NOTE: header type only changes how many
+    #                                 address fields follow — it does NOT by
+    #                                 itself imply the packet must be broadcast.
+    #   bit  5   : context flag
+    #   bit  4   : propagation type  (0 = broadcast, 1 = transport)
     #   bits 3-2 : destination type  <- (flags >> 2) & 0x03
     #   bits 1-0 : packet type       <- flags & 0x03
+    #
+    # Destination hash length (RNS.Reticulum.TRUNCATED_HASHLENGTH // 8).
+    # For HEADER_1 packets: raw[2:2+DST_LEN] is the destination hash.
+    # For HEADER_2 packets: raw[2:2+DST_LEN] is the transport_id, and
+    # raw[2+DST_LEN:2+2*DST_LEN] is the destination hash.
+    _RNS_DST_LEN = 16
     #
     # Packet type constants (bits 1-0):
     _RNS_PTYPE_DATA     = 0x00
@@ -500,15 +447,6 @@ class MeshCore_Dynamic_Interface(Interface):
 
     # Maximum entries in _rns_to_mc_map before the oldest half is pruned
     _RNS_MAP_MAX = 512
-
-    # Maximum entries in _rns_to_sender_map before the oldest half is pruned.
-    # [FIX 1] This map is intentionally separate from _RNS_MAP_MAX / the
-    # resolved-route map: it only ever holds tokens that arrived before the
-    # owning peer's MeshCore key was known, so it should normally stay small
-    # and short-lived. The cap exists purely as a safety backstop against
-    # pathological cases (e.g. a misbehaving peer that never completes
-    # RNSBIND but announces frequently).
-    _RNS_PENDING_MAP_MAX = 256
 
     # -------------------------------------------------------------------------
     # Constructor
@@ -632,38 +570,26 @@ class MeshCore_Dynamic_Interface(Interface):
 
         # Peer resolution tables — all guarded by _peer_lock:
         #
-        #   _peer_table       : node_name        -> mc_pubkey_hex
-        #   _reverse_peers     : mc_pubkey_hex    -> node_name
-        #                        (also stores prefix-length variants for fuzzy lookup)
-        #   _peer_last_seen    : node_name        -> last-heard monotonic timestamp
-        #   _peer_caps         : node_name        -> bool (True = can route upstream)
-        #                        Populated from the RNSBIND capability field.
-        #                        Defaults to True for peers using the old wire format.
-        #                        Informational only — not consulted for packet routing.
-        #   _rns_to_mc_map     : rns_token(bytes) -> mc_pubkey_hex
-        #                        rns_token = bytes 1:11 of a received RNS packet;
-        #                        correlates the RNS source identifier with the
-        #                        MeshCore hardware key for unicast direct delivery.
-        #                        This is the FAST PATH consulted directly by
-        #                        processOutgoing().
-        #   _rns_to_sender_map : rns_token(bytes) -> node_name
-        #                        [FIX 1] PENDING PATH. Populated whenever a
-        #                        packet is reassembled from a sender whose
-        #                        MeshCore key is not yet known in _peer_table
-        #                        (i.e. RNSBIND for that peer hasn't completed
-        #                        yet). processOutgoing() falls back to this map
-        #                        and resolves it against _peer_table at send
-        #                        time, promoting the result into
-        #                        _rns_to_mc_map once resolved. Entries are
-        #                        popped once successfully promoted, and pruned
-        #                        on peer expiry / size cap like the other maps.
-        self._peer_table        = {}
-        self._reverse_peers     = {}
-        self._peer_last_seen    = {}
-        self._peer_caps         = {}
-        self._rns_to_mc_map     = {}
-        self._rns_to_sender_map = {}   # [FIX 1]
-        self._peer_lock         = threading.Lock()
+        #   _peer_table    : node_name        -> mc_pubkey_hex
+        #   _reverse_peers : mc_pubkey_hex    -> node_name
+        #                    (also stores prefix-length variants for fuzzy lookup)
+        #   _peer_last_seen: node_name        -> last-heard monotonic timestamp
+        #   _peer_caps     : node_name        -> bool (True = can route upstream)
+        #                    Populated from the RNSBIND capability field.
+        #                    Defaults to True for peers using the old wire format.
+        #                    Informational only — not consulted for packet routing.
+        #   _rns_to_mc_map : rns_token(bytes) -> mc_pubkey_hex
+        #                    rns_token = header-type-aware destination-hash
+        #                    field (16 bytes; see _extract_rns_token) of a
+        #                    received RNS packet; correlates the RNS source
+        #                    identifier with the MeshCore hardware key for
+        #                    unicast direct delivery.
+        self._peer_table     = {}
+        self._reverse_peers  = {}
+        self._peer_last_seen = {}
+        self._peer_caps      = {}
+        self._rns_to_mc_map  = {}
+        self._peer_lock      = threading.Lock()
 
         # Per-destination outgoing rate limit timestamps
         self._announce_sent_times = {}   # dest_id(bytes) -> monotonic timestamp
@@ -835,9 +761,8 @@ class MeshCore_Dynamic_Interface(Interface):
 
         # The direct-message receive event name varies across library versions.
         _direct_recv_et = None
-        _probed_names = ("CONTACT_MSG_RECV", "DIRECT_MSG_RECV", "PRIVATE_MSG_RECV",
-                          "MSG_RECV", "PRIV_MSG_RECV")
-        for _name in _probed_names:
+        for _name in ("CONTACT_MSG_RECV", "DIRECT_MSG_RECV", "PRIVATE_MSG_RECV",
+                      "MSG_RECV", "PRIV_MSG_RECV"):
             _direct_recv_et = getattr(ET, _name, None)
             if _direct_recv_et is not None:
                 self._mc.subscribe(
@@ -849,26 +774,8 @@ class MeshCore_Dynamic_Interface(Interface):
                 break
 
         if _direct_recv_et is None:
-            # [FIX 4] No supported direct-message event found; disable unicast
-            # routing. Previously this failed silently — every outgoing packet
-            # would then fall back to channel broadcast with the routing log
-            # reading "Direct routing API disabled or undetected by interface",
-            # with no indication of *why*. Surface it loudly at setup time so
-            # a meshcore library version mismatch is immediately diagnosable
-            # instead of presenting as an opaque "direct never works" symptom.
+            # No supported direct-message event found; disable unicast routing.
             self._has_direct_api = False
-            _available = sorted(
-                n for n in dir(ET) if not n.startswith("_")
-            )
-            RNS.log(
-                f"MeshCore_Dynamic_Interface [{self.name}]: "
-                f"No direct-message receive EventType found among probed names "
-                f"{_probed_names} — unicast/direct routing is DISABLED for this "
-                f"interface; all traffic will use channel broadcast. "
-                f"EventType members available in installed meshcore library: "
-                f"{_available}",
-                RNS.LOG_WARNING
-            )
 
         # ACK events are informational; reserved for future reliability work.
         for _name in ("ACK", "MSG_ACKED", "MESSAGE_ACKED", "CHAN_ACK"):
@@ -915,13 +822,6 @@ class MeshCore_Dynamic_Interface(Interface):
         The capability field is included in both REQ and heartbeat messages so
         that peers learn routing capability as early as possible — including from
         the initial solicitation before any response has arrived.
-
-        NOTE: This loop's timing is intentionally decoupled from RNS's own
-        announce schedule (see [FIX 1]). It is normal and expected for an RNS
-        announce from a peer to arrive before this loop's first RNSBIND_REQ has
-        even been sent (the 5s settle delay below, plus channel airtime). The
-        outbound routing path in processOutgoing() is built to tolerate this
-        ordering rather than assume RNSBIND always completes first.
         """
         await asyncio.sleep(5)  # Let the MeshCore connection settle
         retries = 0
@@ -1007,8 +907,7 @@ class MeshCore_Dynamic_Interface(Interface):
         Cleans up:
           - Stale fragment reassembly buffers (older than fragment_timeout_s)
           - Expired peers (silent for longer than peer_ttl_s), including their
-            capability flags and associated RNS→MC route map entries, AND any
-            pending (unresolved) RNS→sender entries for that peer [FIX 1]
+            capability flags and associated RNS→MC route map entries
           - Old outgoing announce rate timestamps (older than 2× rate window)
           - Old outgoing path request rate timestamps (older than 2× rate window)
         """
@@ -1034,7 +933,6 @@ class MeshCore_Dynamic_Interface(Interface):
                     name for name, ts in self._peer_last_seen.items()
                     if ts < peer_deadline
                 ]
-                expired_set = set(expired)
                 for name in expired:
                     mc_key = self._peer_table.pop(name, None)
                     self._peer_last_seen.pop(name, None)
@@ -1050,17 +948,6 @@ class MeshCore_Dynamic_Interface(Interface):
                         ]
                         for t in stale_tokens:
                             del self._rns_to_mc_map[t]
-                if expired_set:
-                    # [FIX 1] Also prune any pending (unresolved) tokens that
-                    # belonged to a now-expired peer — there is no point
-                    # holding onto a token waiting to resolve against a peer
-                    # that has just been forgotten.
-                    stale_pending = [
-                        t for t, n in self._rns_to_sender_map.items()
-                        if n in expired_set
-                    ]
-                    for t in stale_pending:
-                        del self._rns_to_sender_map[t]
                 if expired:
                     RNS.log(
                         f"MeshCore_Dynamic_Interface [{self.name}]: "
@@ -1159,13 +1046,6 @@ class MeshCore_Dynamic_Interface(Interface):
         Both message types trigger identical peer table updates — every
         overhearing node learns the sender's identity and capability (passive
         L2 learning).  A RNSBIND_REQ additionally schedules a delayed response.
-
-        [FIX 1] Whenever a peer's MeshCore key becomes known (or changes) here,
-        any tokens parked in _rns_to_sender_map for that peer name are eagerly
-        promoted into the fast-path _rns_to_mc_map immediately, rather than
-        waiting for processOutgoing() to resolve them lazily on the next send
-        attempt. This minimises the window during which a learned route sits
-        unresolved.
         """
         # Disambiguate REQ vs plain response.
         # (req_idx <= bind_idx handles the equal-index case caused by RNSBIND:
@@ -1194,7 +1074,6 @@ class MeshCore_Dynamic_Interface(Interface):
         if not mc_pubkey:
             return
 
-        promoted_tokens = 0
         with self._peer_lock:
             existing    = self._peer_table.get(sender_name)
             cap_changed = self._peer_caps.get(sender_name) != peer_can_route
@@ -1210,31 +1089,12 @@ class MeshCore_Dynamic_Interface(Interface):
             self._peer_caps[sender_name]      = peer_can_route
             self._peer_last_seen[sender_name] = time.monotonic()
 
-            # [FIX 1] Eagerly promote any pending tokens parked for this
-            # sender now that its MeshCore key is known.
-            if self._rns_to_sender_map:
-                pending_tokens = [
-                    t for t, n in self._rns_to_sender_map.items()
-                    if n == sender_name
-                ]
-                for t in pending_tokens:
-                    self._rns_to_mc_map[t] = mc_pubkey
-                    del self._rns_to_sender_map[t]
-                promoted_tokens = len(pending_tokens)
-
         if existing != mc_pubkey or cap_changed:
             RNS.log(
                 f"MeshCore_Dynamic_Interface [{self.name}]: "
                 f"{'REQ from' if is_req else 'Peer'} '{sender_name}' "
                 f"-> {mc_pubkey[:16]}... "
                 f"[{'router' if peer_can_route else 'edge — no upstream routing'}]",
-                RNS.LOG_INFO
-            )
-        if promoted_tokens:
-            RNS.log(
-                f"MeshCore_Dynamic_Interface [{self.name}]: "
-                f"Promoted {promoted_tokens} pending direct route(s) for "
-                f"'{sender_name}' now that its MeshCore key is known.",
                 RNS.LOG_INFO
             )
 
@@ -1264,30 +1124,15 @@ class MeshCore_Dynamic_Interface(Interface):
 
         Dynamic L2/L3 link learning
         ───────────────────────────
-        Once a packet is fully reassembled, bytes 1:11 are extracted as an RNS
-        origin token.  This window is consistent across the announce → path-reply
-        → data packet sequence for a given RNS destination, AND is the same
-        fixed window used on the outbound lookup side in processOutgoing()
-        (see [FIX 2] and the WIRE FORMAT / RNS TOKEN WINDOW note in the module
-        docstring — these two windows must never diverge).
-
-        [FIX 1] If the sender's MeshCore key is already known (RNSBIND has
-        completed for this peer), the token is written straight into the
-        fast-path _rns_to_mc_map, exactly as before. If the MeshCore key is
-        NOT yet known — e.g. this is the peer's first announce, arriving
-        before RNSBIND discovery has completed — the token is instead parked
-        in _rns_to_sender_map keyed by sender NAME, so it can be resolved
-        retroactively (by processOutgoing(), or eagerly by a later
-        _handle_bind() call) once the key becomes known. Previously this case
-        silently dropped the routing opportunity and could leave a peer
-        permanently un-resolved if the "already in map" guard had nothing to
-        latch onto.
-
-        [FIX 3] The previous "only write if not already present" guard has
-        been removed. The route is now refreshed on every successful
-        reassembly, so a peer that changes its MeshCore key (firmware
-        reflash, factory reset) self-heals instead of leaving a stale,
-        dead key in the map until peer_ttl expires.
+        Once a packet is fully reassembled, its header-type-aware destination-
+        hash field is extracted as an RNS routing token (see
+        _extract_rns_token).  This window is consistent across the announce →
+        path-reply → data packet sequence for a given RNS destination, and
+        transparently also covers link_id once an RNS Link is established
+        (link_id occupies the same wire position as the destination hash).  If the sender is a
+        known MeshCore peer, the token is stored in _rns_to_mc_map.  Subsequent
+        outgoing packets whose next-hop token matches will be sent via unicast
+        direct message instead of channel broadcast, reducing channel load.
 
         Entries in _rns_to_mc_map represent paths that have demonstrably carried
         traffic, including paths that transit through an edge node to reach a
@@ -1364,53 +1209,52 @@ class MeshCore_Dynamic_Interface(Interface):
         if not full_packet:
             return
 
-        # Dynamic L2/L3 link learning: index bytes 1:11 of the reassembled
-        # packet (RNS origin token) against the MeshCore sender key so that
-        # future outbound packets for this destination can be sent unicast.
+        # Dynamic L2/L3 link learning: extract the destination-hash field of
+        # the reassembled packet (header-type aware — see _extract_rns_token)
+        # against the MeshCore sender key so that future outbound packets for
+        # this destination (or, once a link is established, this link_id) can
+        # be sent unicast.
         rns_token = self._extract_rns_token(full_packet)
-        if rns_token and sender:
+        if rns_token is not None and sender:
             with self._peer_lock:
                 mc_key = self._peer_table.get(sender)
                 if mc_key:
-                    # [FIX 3] Always refresh — do not gate on "not already
-                    # present" so a peer's key change self-heals.
-                    self._rns_to_mc_map[rns_token] = mc_key
-                    # A token that's now resolved should not also linger in
-                    # the pending map under a stale association.
-                    self._rns_to_sender_map.pop(rns_token, None)
-                    if len(self._rns_to_mc_map) > self._RNS_MAP_MAX:
-                        trim = list(self._rns_to_mc_map.keys())[
-                            : self._RNS_MAP_MAX // 2
-                        ]
-                        for t in trim:
-                            del self._rns_to_mc_map[t]
-                    if self.debug_level == "debug":
-                        RNS.log(
-                            f"MeshCore_Dynamic_Interface [{self.name}]: "
-                            f"Linked RNS token {rns_token.hex()[:8]} "
-                            f"-> '{sender}'",
-                            RNS.LOG_DEBUG
-                        )
-                else:
-                    # [FIX 1] Peer not yet resolved via RNSBIND — park the
-                    # token by sender name for later/retroactive resolution
-                    # instead of dropping it.
-                    self._rns_to_sender_map[rns_token] = sender
-                    if len(self._rns_to_sender_map) > self._RNS_PENDING_MAP_MAX:
-                        trim = list(self._rns_to_sender_map.keys())[
-                            : self._RNS_PENDING_MAP_MAX // 2
-                        ]
-                        for t in trim:
-                            del self._rns_to_sender_map[t]
-                    if self.debug_level == "debug":
-                        RNS.log(
-                            f"MeshCore_Dynamic_Interface [{self.name}]: "
-                            f"Parked RNS token {rns_token.hex()[:8]} -> "
-                            f"'{sender}' (MeshCore key not yet known; "
-                            f"pending RNSBIND)",
-                            RNS.LOG_DEBUG
-                        )
+                    if rns_token not in self._rns_to_mc_map:
+                        self._rns_to_mc_map[rns_token] = mc_key
+                        # Prune oldest half if the map exceeds the size cap
+                        if len(self._rns_to_mc_map) > self._RNS_MAP_MAX:
+                            trim = list(self._rns_to_mc_map.keys())[
+                                : self._RNS_MAP_MAX // 2
+                            ]
+                            for t in trim:
+                                del self._rns_to_mc_map[t]
+                        if self.debug_level == "debug":
+                            RNS.log(
+                                f"MeshCore_Dynamic_Interface [{self.name}]: "
+                                f"Linked RNS token {rns_token.hex()[:8]} "
+                                f"-> '{sender}'",
+                                RNS.LOG_DEBUG
+                            )
 
+                    # Proactive link_id binding: if this is a LINK_REQUEST
+                    # packet, derive the link_id it will be answered under and
+                    # bind it to the same peer right now. Without this, the
+                    # accepting side's very first outbound packet on the new
+                    # link (its LINK PROOF, addressed to link_id) would always
+                    # miss the route cache and fall back to broadcast, since
+                    # link_id never appears as an inbound token until after
+                    # the link is already established.
+                    if full_packet[0] & 0x03 == self._RNS_PTYPE_LINK_REQ:
+                        link_id = self._link_id_from_lr_packet(full_packet)
+                        if link_id is not None and link_id not in self._rns_to_mc_map:
+                            self._rns_to_mc_map[link_id] = mc_key
+                            if self.debug_level == "debug":
+                                RNS.log(
+                                    f"MeshCore_Dynamic_Interface [{self.name}]: "
+                                    f"Pre-bound link_id {link_id.hex()[:8]} "
+                                    f"-> '{sender}' from LINK_REQUEST",
+                                    RNS.LOG_DEBUG
+                                )
         if full_packet:
             # Extract RNS packet type (bits 1-0 of the header byte)
             ptype = full_packet[0] & 0x03
@@ -1434,29 +1278,6 @@ class MeshCore_Dynamic_Interface(Interface):
                 f"Delivery error: {exc}", RNS.LOG_ERROR
             )
 
-    def _extract_rns_token(self, data: bytes) -> bytes:
-        """
-        Dynamically extracts an invariant 10-byte RNS address token.
-        Excludes the volatile network hops byte (data[1]) to ensure tracking
-        remains stable across multi-hop transport boundaries.
-        """
-        if len(data) < 3:
-            return b""
-
-        header_type = (data[0] >> 6) & 0x01
-        dest_type = (data[0] >> 2) & 0x03
-
-        # LINK Packets: Extract 10-byte Link ID
-        if dest_type == 0x03: 
-            return data[2:12] if len(data) >= 12 else b""
-        
-        # Header Type 2: Inbound multi-hop frame. Isolate 10 bytes of Peer Source Hash
-        if header_type == 1:
-            return data[18:28] if len(data) >= 28 else b""
-        
-        # Header Type 1: Single address frame. Isolate 10 bytes of Destination Hash
-        return data[2:12] if len(data) >= 12 else b""
-  
     # -------------------------------------------------------------------------
     # Outbound
     # -------------------------------------------------------------------------
@@ -1466,27 +1287,107 @@ class MeshCore_Dynamic_Interface(Interface):
         Return True if this RNS packet must be sent via channel broadcast rather
         than unicast direct message.
 
-        Announces are always broadcast — all nodes need them for path discovery.
-        Two-byte-header packets (bit 7 set) are also always broadcast.
+        Only two conditions mandate broadcast:
+          - ANNOUNCE packets — all nodes need them for path discovery.
+          - DATA packets addressed to a PLAIN destination (path requests) —
+            per the RNS spec, plain destinations are only reachable directly
+            and are never transported over multiple hops, so a cached "next
+            hop" for one is meaningless and potentially wrong (a stale/
+            colliding token could otherwise misroute a path request to the
+            wrong unicast peer instead of broadcasting it).
 
-        The packet type is in bits 1-0 of the header byte.  Bits 3-2 are the
-        destination type — a different field.  Extracting bits 3-2 instead would
-        cause unicast data packets to be misidentified as broadcast, adding
-        unnecessary load to the shared channel.
+        Header type (bit 6) does NOT determine broadcast vs. unicast — it only
+        indicates whether a transport_id field precedes the destination hash.
+        A HEADER_2 (in-transit) packet can be perfectly valid to unicast to a
+        known next hop, same as a HEADER_1 packet.
         """
         if len(data) < 1:
             return True
-        flags = data[0]
-        if flags & 0x80:
-            # Two-byte header format — always broadcast
+        flags     = data[0]
+        ptype     = flags & 0x03          # bits 1-0 = packet type
+        dest_type = (flags >> 2) & 0x03   # bits 3-2 = destination type
+        if ptype == self._RNS_PTYPE_ANNOUNCE:
             return True
-        ptype = flags & 0x03   # bits 1-0 = packet type
-        return ptype == self._RNS_PTYPE_ANNOUNCE
+        if ptype == self._RNS_PTYPE_DATA and dest_type == self._RNS_DTYPE_PLAIN:
+            return True
+        return False
+
+    def _extract_rns_token(self, data: bytes):
+        """
+        Extract the 16-byte RNS destination-hash field from a packet, correctly
+        accounting for header type.
+
+        raw[0]      = flags
+        raw[1]      = hops                     (volatile — changes every hop,
+                                                  must NEVER be included in the
+                                                  token)
+        HEADER_1:  raw[2 : 2+DST_LEN]           = destination_hash
+        HEADER_2:  raw[2 : 2+DST_LEN]           = transport_id
+                   raw[2+DST_LEN : 2+2*DST_LEN] = destination_hash
+
+        For RNS Links (NomadNet, LXMF sync, group chat), once a link is
+        established this same field carries the link's link_id instead of the
+        original destination hash — that's expected and handled transparently,
+        since link_id is just another 16-byte value that lands in the same
+        wire position.
+
+        Returns None if the packet is too short to contain the field.
+        """
+        if len(data) < 2:
+            return None
+        header_type = (data[0] & 0x40) >> 6
+        DST_LEN = self._RNS_DST_LEN
+        if header_type == 1:  # HEADER_2 — transport_id then destination_hash
+            end = 2 + 2 * DST_LEN
+            if len(data) < end:
+                return None
+            return bytes(data[2 + DST_LEN:end])
+        else:  # HEADER_1
+            end = 2 + DST_LEN
+            if len(data) < end:
+                return None
+            return bytes(data[2:end])
+
+    def _link_id_from_lr_packet(self, raw: bytes):
+        """
+        Replicate RNS's own link_id derivation (Packet.get_hashable_part() +
+        truncated SHA-256) so that when we observe an inbound LINK_REQUEST
+        packet, we can proactively bind the link_id it will be answered under
+        to the MeshCore peer that delivered it — *before* we ever need to send
+        anything addressed to that link_id ourselves.
+
+        This closes the gap that a passive "learn from what I've already seen"
+        token map cannot: the accepting side of a link must send its LINK
+        PROOF addressed to link_id as its very first outbound packet on that
+        link, without ever having seen link_id appear as an inbound token.
+
+            hashable_part = bytes([raw[0] & 0b00001111])   # dest_type + packet_type only
+            hashable_part += raw[2:]      if HEADER_1
+                           += raw[2+DST_LEN:] if HEADER_2
+            link_id = sha256(hashable_part)[:DST_LEN]
+
+        NOTE: this mirrors RNS/Packet.py::get_hashable_part() and assumes
+        standard RNS.Identity.truncated_hash() semantics (SHA-256, truncated
+        to DST_LEN bytes). Verify against your local Identity.py if RNS ever
+        changes this — it is not re-derived from that file here.
+        """
+        if len(raw) < 2:
+            return None
+        DST_LEN = self._RNS_DST_LEN
+        header_type = (raw[0] & 0x40) >> 6
+        hashable = bytes([raw[0] & 0b00001111])
+        if header_type == 1:
+            if len(raw) < 2 + DST_LEN:
+                return None
+            hashable += raw[2 + DST_LEN:]
+        else:
+            hashable += raw[2:]
+        return hashlib.sha256(hashable).digest()[:DST_LEN]
 
     def process_outgoing(self, data):
         """Compatibility shim — RNS may call either spelling."""
         return self.processOutgoing(data)
-    
+
     def processOutgoing(self, data):
         """
         Fragment and enqueue an outbound RNS packet.
@@ -1510,25 +1411,11 @@ class MeshCore_Dynamic_Interface(Interface):
         Routing decision
         ────────────────
         Broadcast packets (announces, link requests) always go to the shared
-        channel.  For all other traffic:
-
-          1. The RNS token is looked up directly in _rns_to_mc_map. 
-             If found, the packet goes direct immediately.
-
-          2. [FIX 1] If not found in the fast-path map, the token is checked
-             against _rns_to_sender_map (tokens learned before the owning
-             peer's MeshCore key was known). If a sender name is found there
-             AND that peer has since completed RNSBIND (now present in
-             _peer_table), the route is resolved on the spot, promoted into
-             _rns_to_mc_map for future fast-path hits, and the packet goes
-             direct on this same call — no need to wait for another announce
-             cycle from the peer.
-
-          3. Otherwise, the packet falls back to channel broadcast.
-
-        The cached route is trusted unconditionally once resolved — it exists
-        only because traffic has demonstrably flowed over it, including traffic
-        that transits through an edge node to reach a downstream client.
+        channel.  For all other traffic, if a unicast route is cached in
+        _rns_to_mc_map for the next-hop RNS token, the packet is sent via
+        MeshCore direct message.  The cached route is trusted unconditionally —
+        it exists only because traffic has demonstrably flowed over it, including
+        traffic that transits through an edge node to reach a downstream client.
         """
         if not self.online:
             return
@@ -1568,90 +1455,24 @@ class MeshCore_Dynamic_Interface(Interface):
 
         handler   = _PacketHandler(data, pkt_id, self.payload_size)
         broadcast = self._is_broadcast_packet(data)
-        
-        # Identify explicit network path discovery frames
-        is_path_req = (ptype == self._RNS_PTYPE_DATA and dest_type == self._RNS_DTYPE_PLAIN)
 
-        is_link_req = (ptype == self._RNS_PTYPE_LINK)
-      
         # Resolve a unicast next-hop from the cached RNS→MC route map.
         target_key = None
         channel_reason = ""
 
         if broadcast:
             channel_reason = "Mandatory broadcast packet (e.g., Announce)"
-        elif is_path_req:
-            # Discovery signals must remain omnidirectional to traverse mesh topology
-            channel_reason = "Network discovery frame (Path Request) - bypassing unicast map"
-        elif is_link_req and self._peer_table:
-            if next_hop_token in self._rns_to_mc_map:
-                target_key = self._rns_to_mc_map[next_hop_token]
-            else
-                channel_reason = "Standard RNS link establishment"
         elif not self._has_direct_api:
             channel_reason = "Direct routing API disabled or undetected by interface"
-        elif len(data) < 11:
-            channel_reason = f"Packet too short to extract origin token (len: {len(data)})"
         else:
-            # -------------------------------------------------------------
-            # OUTBOUND TOKEN EXTRACTION
-            # For outbound packets, the destination next-hop token is ALWAYS
-            # derived from Address 1 (the Destination Hash), regardless of whether
-            # it is a Header Type 1 or Header Type 2 packet.
-            # -------------------------------------------------------------
-            if dest_type == self._RNS_DTYPE_LINK:
-                # Reticulum Wire Protocol Spec: LINK ID occupies bytes 2:12
-                next_hop_token = data[2:12] if len(data) >= 12 else b""
+            next_hop_token = self._extract_rns_token(data)
+            if next_hop_token is None:
+                channel_reason = f"Packet too short to extract destination token (len: {len(data)})"
             else:
-                # Standard packet destination: Hops byte (data[1]) + first 9 bytes of Destination Address
-                next_hop_token = data[2:12] if len(data) >= 12 else b""
-
-            if not next_hop_token:
-                channel_reason = "Packet too short for RNS token extraction"
-            else:
-                # -------------------------------------------------------------
-                # DYNAMIC LINK TARGET RESOLUTION
-                # If this payload is traveling over an established RNS link, the 
-                # next_hop_token is a 10-byte truncated Link ID. We must query
-                # Reticulum's global Transport table to find the actual target
-                # identity hash associated with this specific connection session.
-                # -------------------------------------------------------------
-                lookup_token = next_hop_token
-                if dest_type == self._RNS_DTYPE_LINK:
-                    for link in getattr(RNS.Transport, "links", []):
-                        if getattr(link, "link_id", b"")[:10] == next_hop_token:
-                            if getattr(link, "type", None) == RNS.Link.OUT:
-                                lookup_token = link.destination.hash
-                            elif getattr(link, "type", None) == RNS.Link.IN and getattr(link, "remote_identity", None):
-                                lookup_token = link.remote_identity.hash
-                            break
-
                 with self._peer_lock:
-                    target_key = self._rns_to_mc_map.get(lookup_token)
-                    resolved_pending_name = None
-                    if not target_key:
-                        # [FIX 1] Retroactive resolution: check the pending map
-                        # for users whose identity was confirmed post-announcement.
-                        pending_name = self._rns_to_sender_map.get(lookup_token)
-                        if pending_name:
-                            candidate_key = self._peer_table.get(pending_name)
-                            if candidate_key:
-                                target_key = candidate_key
-                                self._rns_to_mc_map[lookup_token] = candidate_key
-                                del self._rns_to_sender_map[lookup_token]
-                                resolved_pending_name = pending_name
-
-            if resolved_pending_name:
-                RNS.log(
-                    f"MeshCore_Dynamic_Interface [{self.name}]: "
-                    f"Retroactively resolved direct route for token "
-                    f"{lookup_token.hex()[:8]} -> '{resolved_pending_name}' "
-                    f"(RNSBIND has since completed for this peer).",
-                    RNS.LOG_INFO
-                )
-
-            if not target_key:
-                channel_reason = f"No direct route bound for RNS token {lookup_token.hex()[:8]}"
+                    target_key = self._rns_to_mc_map.get(next_hop_token)
+                if not target_key:
+                    channel_reason = f"No direct route bound for RNS token {next_hop_token.hex()[:8]}"
 
         # Apply routing decision and log the result
         if channel_reason:
@@ -1664,7 +1485,7 @@ class MeshCore_Dynamic_Interface(Interface):
         else:
             RNS.log(
                 f"MeshCore_Dynamic_Interface [{self.name}]: "
-                f"Routing -> DIRECT via peer key {target_key[:12].hex() if isinstance(target_key, bytes) else target_key}...",
+                f"Routing -> DIRECT via peer key {target_key[:12]}...",
                 RNS.LOG_INFO
             )
             route = [("direct", target_key)]
@@ -1711,14 +1532,6 @@ class MeshCore_Dynamic_Interface(Interface):
                     self._outqueue.put_nowait(item)
                 except asyncio.QueueFull:
                     pass
-                # [FIX 5] task_done() must be called for every get() exactly
-                # once, regardless of which path the item takes. The previous
-                # code "continue"d here without it, permanently inflating
-                # asyncio.Queue's internal unfinished-tasks counter. Not
-                # currently load-bearing (nothing calls queue.join() today),
-                # but left uncorrected this would silently break any future
-                # graceful-shutdown / drain logic added on top of this queue.
-                self._outqueue.task_done()
                 continue
 
             mode, target, frag_str = item
