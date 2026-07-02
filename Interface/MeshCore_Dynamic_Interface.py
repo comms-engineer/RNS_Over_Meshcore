@@ -185,6 +185,9 @@ INFRASTRUCTURE / TRANSPORT NODE  (fixed gateway with backbone connectivity)
   │     # Outgoing rate limiting (set to 0 to disable)                     │
   │     outgoing_announce_rate = 600    # min s between announces per dest │
   │     outgoing_path_req_rate = 1800   # min s between path reqs per dest │
+  │     path_req_burst_window = 60      # s to let RNS's own retry burst   │
+  │                                      # through before the cooldown     │
+  │                                      # above applies (see code comment)│
   │                                                                         │
   │     # Optional hard bandwidth cap in bits per second (0 = disabled)    │
   │     # rate_limit = 1200                                                 │
@@ -363,6 +366,16 @@ class MeshCore_Dynamic_Interface(Interface):
 
         self._announce_rate_s = float(cfg.get("outgoing_announce_rate", 600))
         self._path_req_rate_s = float(cfg.get("outgoing_path_req_rate", 1800))
+
+        # RNS's own outbound retry logic fires a burst of path requests to the
+        # same destination roughly 4-10s apart (typically ~4 attempts over
+        # ~50s) before giving up. If outgoing_path_req_rate suppresses all but
+        # the first of those, a single lost broadcast (common on lossy LoRa)
+        # means the whole burst fails with no recovery for the full cooldown
+        # period. path_req_burst_window lets RNS's own retry burst through
+        # unthrottled; outgoing_path_req_rate only takes effect once the
+        # burst window has elapsed, to stop genuine long-run spam.
+        self._path_req_burst_window_s = float(cfg.get("path_req_burst_window", 60))
 
         # --- Routing capability --------------------------------------------
         self.can_route = (
@@ -746,8 +759,8 @@ class MeshCore_Dynamic_Interface(Interface):
                 pr_deadline = now - (self._path_req_rate_s * 2)
                 with self._path_req_sent_lock:
                     stale_pr = [
-                        k for k, ts in self._path_req_sent_times.items()
-                        if ts < pr_deadline
+                        k for k, (_, last_ts) in self._path_req_sent_times.items()
+                        if last_ts < pr_deadline
                     ]
                     for k in stale_pr:
                         del self._path_req_sent_times[k]
@@ -1042,15 +1055,32 @@ class MeshCore_Dynamic_Interface(Interface):
                         return
                     self._announce_sent_times[dest_id] = now
 
-        # Per-destination outgoing path request rate limiter
+        # Per-destination outgoing path request rate limiter, with a burst
+        # window that lets RNS's own natural retry cluster through before the
+        # long-run anti-spam cooldown kicks in. See path_req_burst_window
+        # comment in __init__ for rationale.
         if self._path_req_rate_s > 0 and len(data) >= 12:
             if ptype == self._RNS_PTYPE_DATA and dest_type == self._RNS_DTYPE_PLAIN:
                 dest_id = bytes(data[2:12])
                 now     = time.monotonic()
                 with self._path_req_sent_lock:
-                    if now - self._path_req_sent_times.get(dest_id, 0) < self._path_req_rate_s:
-                        return
-                    self._path_req_sent_times[dest_id] = now
+                    entry = self._path_req_sent_times.get(dest_id)
+                    if entry is None:
+                        # First request for this destination: starts a new burst.
+                        self._path_req_sent_times[dest_id] = (now, now)
+                    else:
+                        first_ts, last_ts = entry
+                        if now - first_ts < self._path_req_burst_window_s:
+                            # Still inside the burst window -- let it through,
+                            # just refresh last_ts for cleanup purposes.
+                            self._path_req_sent_times[dest_id] = (first_ts, now)
+                        elif now - last_ts < self._path_req_rate_s:
+                            # Burst window elapsed and still within the
+                            # long-run cooldown -- suppress.
+                            return
+                        else:
+                            # Cooldown expired -- this starts a fresh burst.
+                            self._path_req_sent_times[dest_id] = (now, now)
 
         with self._pkt_id_lock:
             pkt_id       = self._pkt_id
