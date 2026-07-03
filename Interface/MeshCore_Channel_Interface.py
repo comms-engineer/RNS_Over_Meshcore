@@ -128,11 +128,34 @@ import asyncio
 import base64
 import hashlib
 import json
+import os
 import queue
 import socket
+import sys
 import threading
 import time
 from collections import OrderedDict
+
+# Shared MeshCore utilities (handles Reticulum's exec()-based file loading)
+try:
+    _iface_dir = os.path.dirname(os.path.abspath(__file__))
+except NameError:
+    _iface_dir = os.path.expanduser("~/.reticulum/interfaces")
+if _iface_dir not in sys.path:
+    sys.path.insert(0, _iface_dir)
+
+from _meshcore_shared import (
+    load_meshcore,
+    start_asyncio_loop_thread,
+    create_meshcore_connection,
+    configure_radio,
+    configure_channel,
+    process_incoming,
+    decode_tunnel_frame,
+    reassemble_fragment,
+    cleanup_stale_fragments,
+    PacketIdCounter,
+)
 # urllib.error and urllib.request are imported lazily inside the three methods
 # that use them (_send_via_remoteterm, _rt_get_sync, _rt_post_sync).
 # Top-level submodule imports (dotted names) trigger a Python 3.13 bug in
@@ -281,8 +304,7 @@ class MeshCore_Channel_Interface(Interface):
         self._worker_thread = None
 
         self._own_src_id  = self._derive_local_src_id()
-        self._pkt_id      = 0
-        self._pkt_id_lock = threading.Lock()
+        self._pkt_counter = PacketIdCounter(bits=8)
 
         self._outqueue = queue.Queue(maxsize=self.OUTQUEUE_MAXSIZE)
 
@@ -302,12 +324,10 @@ class MeshCore_Channel_Interface(Interface):
             self._load_meshcore_or_panic()
 
         # ---- start asyncio event loop thread ----
-        self._loop = asyncio.new_event_loop()
-        self._loop_thread = threading.Thread(
-            target=self._run_loop, daemon=True,
-            name=f"MCChan-loop-{self.name}"
+        self._loop, self._loop_thread = start_asyncio_loop_thread(
+            f"MCChan-loop-{self.name}",
+            f"MeshCore_Channel_Interface [{self.name}]",
         )
-        self._loop_thread.start()
 
         # ---- start outgoing worker thread ----
         self._worker_thread = threading.Thread(
@@ -336,16 +356,10 @@ class MeshCore_Channel_Interface(Interface):
 
     def _load_meshcore_or_panic(self):
         try:
-            import meshcore as _mc_module
-            self._mc_module = _mc_module
-            self._EventType = _mc_module.EventType
-        except ImportError:
-            RNS.log(
-                f"MeshCore_Channel_Interface [{self.name}]: "
-                "meshcore library not found. "
-                "Install with: pip install meshcore [--break-system-packages]",
-                RNS.LOG_CRITICAL
+            self._mc_module, self._EventType = load_meshcore(
+                f"MeshCore_Channel_Interface [{self.name}]"
             )
+        except ImportError:
             RNS.panic()
 
     def _load_websockets_or_panic(self):
@@ -372,17 +386,6 @@ class MeshCore_Channel_Interface(Interface):
     # -----------------------------------------------------------------------
     # Event loop management
     # -----------------------------------------------------------------------
-
-    def _run_loop(self):
-        asyncio.set_event_loop(self._loop)
-        try:
-            self._loop.run_forever()
-        except Exception as exc:
-            RNS.log(
-                f"MeshCore_Channel_Interface [{self.name}]: "
-                f"event loop crashed: {exc}",
-                RNS.LOG_ERROR
-            )
 
     def _run_coro(self, coro, timeout: float = 20.0):
         if self._loop is None or not self._loop.is_running():
@@ -418,40 +421,21 @@ class MeshCore_Channel_Interface(Interface):
     # =======================================================================
 
     async def _async_setup_direct(self):
-        MeshCore = self._mc_module.MeshCore
-        ET       = self._EventType
+        ET    = self._EventType
+        iname = f"MeshCore_Channel_Interface [{self.name}]"
 
         try:
-            if self.transport == "serial":
-                self._mc = await MeshCore.create_serial(self.port, self.baudrate)
-                RNS.log(
-                    f"MeshCore_Channel_Interface [{self.name}]: "
-                    f"connected via serial {self.port}", RNS.LOG_INFO
-                )
-            elif self.transport == "ble":
-                self._mc = await MeshCore.create_ble(self.ble_name or None)
-                RNS.log(
-                    f"MeshCore_Channel_Interface [{self.name}]: "
-                    "connected via BLE", RNS.LOG_INFO
-                )
-            elif self.transport == "tcp":
-                self._mc = await MeshCore.create_tcp(self.host, self.tcp_port)
-                RNS.log(
-                    f"MeshCore_Channel_Interface [{self.name}]: "
-                    f"connected via TCP {self.host}:{self.tcp_port}", RNS.LOG_INFO
-                )
-            else:
-                RNS.log(
-                    f"MeshCore_Channel_Interface [{self.name}]: "
-                    f"unknown transport '{self.transport}'",
-                    RNS.LOG_CRITICAL
-                )
-                return
-        except Exception as exc:
-            RNS.log(
-                f"MeshCore_Channel_Interface [{self.name}]: "
-                f"connection failed: {exc}", RNS.LOG_ERROR
+            self._mc = await create_meshcore_connection(
+                self._mc_module, self.transport,
+                port=self.port, baudrate=self.baudrate,
+                host=self.host, tcp_port=self.tcp_port,
+                ble_name=self.ble_name, interface_name=iname,
             )
+        except ValueError as exc:
+            RNS.log(f"{iname}: {exc}", RNS.LOG_CRITICAL)
+            return
+        except Exception as exc:
+            RNS.log(f"{iname}: Connection failed: {exc}", RNS.LOG_ERROR)
             return
 
         try:
@@ -470,39 +454,15 @@ class MeshCore_Channel_Interface(Interface):
                 f"send_appstart error: {exc}", RNS.LOG_WARNING
             )
 
-        if self.radio_freq and self.radio_bw and self.radio_sf and self.radio_cr:
-            try:
-                result = await self._mc.commands.set_radio(
-                    self.radio_freq, self.radio_bw, self.radio_sf, self.radio_cr)
-                if result.type == ET.OK:
-                    RNS.log(
-                        f"MeshCore_Channel_Interface [{self.name}]: "
-                        f"radio set freq={self.radio_freq} bw={self.radio_bw} "
-                        f"sf={self.radio_sf} cr={self.radio_cr}", RNS.LOG_INFO
-                    )
-            except Exception as exc:
-                RNS.log(
-                    f"MeshCore_Channel_Interface [{self.name}]: "
-                    f"radio config error: {exc}", RNS.LOG_WARNING
-                )
+        await configure_radio(
+            self._mc, self.radio_freq, self.radio_bw,
+            self.radio_sf, self.radio_cr, interface_name=iname,
+        )
 
-        try:
-            secret_bytes = bytes.fromhex(self.channel_secret_hex)
-            if len(secret_bytes) != 16:
-                raise ValueError(f"channel_secret must be 16 bytes, got {len(secret_bytes)}")
-            result = await self._mc.commands.set_channel(
-                self.channel_idx, self.channel_name, secret_bytes)
-            if result.type == ET.OK:
-                RNS.log(
-                    f"MeshCore_Channel_Interface [{self.name}]: "
-                    f"channel {self.channel_idx} ('{self.channel_name}') configured",
-                    RNS.LOG_INFO
-                )
-        except Exception as exc:
-            RNS.log(
-                f"MeshCore_Channel_Interface [{self.name}]: "
-                f"channel config error: {exc}", RNS.LOG_WARNING
-            )
+        await configure_channel(
+            self._mc, self.channel_idx, self.channel_name,
+            self.channel_secret_hex, interface_name=iname,
+        )
 
         # Subscribe WITHOUT attribute_filters — some firmware versions report
         # all received channel messages with channel_idx=0 regardless of the
@@ -804,48 +764,31 @@ class MeshCore_Channel_Interface(Interface):
         Decode, validate header, and reassemble one channel message.
         All silent drops are logged in debug mode.
         """
-        # MeshCore prepends the sender's node name to channel message text,
-        # e.g. "Janus39: RNS:..." instead of "RNS:...".
-        # Find the RNS: marker wherever it appears and strip everything before it.
-        rns_idx = text.find(self.MSG_PREFIX)
-        if rns_idx == -1:
-            if self.debug_level == "debug" and text:
-                RNS.log(
-                    f"MeshCore_Channel_Interface [{self.name}]: "
-                    f"pipeline drop: no RNS: marker found  text={text[:40]}",
-                    RNS.LOG_DEBUG
-                )
+        iname = f"MeshCore_Channel_Interface [{self.name}]"
+
+        # Decode the tunnel frame (strip sender prefix + base64 decode)
+        raw, sender_prefix = decode_tunnel_frame(
+            text, self.MSG_PREFIX, interface_name=iname,
+        )
+        if raw is None:
+            if sender_prefix is None:
+                if self.debug_level == "debug" and text:
+                    RNS.log(
+                        f"{iname}: "
+                        f"pipeline drop: no RNS: marker found  text={text[:40]}",
+                        RNS.LOG_DEBUG
+                    )
             return
-        if rns_idx > 0:
+        if sender_prefix:
             RNS.log(
-                f"MeshCore_Channel_Interface [{self.name}]: "
-                f"stripped sender prefix {text[:rns_idx]!r}",
+                f"{iname}: "
+                f"stripped sender prefix {sender_prefix!r}",
                 RNS.LOG_DEBUG
             )
-            text = text[rns_idx:]
-
-        b64 = text[len(self.MSG_PREFIX):].strip()
-
-        b64 += "=" * (-len(b64) % 4)
-
-        try:
-
-            raw = base64.urlsafe_b64decode(b64)
-
-        except Exception as exc:
-            RNS.log(
-                f"MeshCore_Channel_Interface [{self.name}]: "
-                f"base64 decode error: {exc} "
-                f"len={len(b64)} "
-                f"mod4={len(b64)%4} "
-                f"text={text[:80]}",
-                RNS.LOG_WARNING
-            )
-            return
 
         if len(raw) < self.HEADER_SIZE:
             RNS.log(
-                f"MeshCore_Channel_Interface [{self.name}]: "
+                f"{iname}: "
                 f"pipeline drop: frame too short ({len(raw)} < {self.HEADER_SIZE})",
                 RNS.LOG_WARNING
             )
@@ -859,18 +802,12 @@ class MeshCore_Channel_Interface(Interface):
         payload    = raw[self.HEADER_SIZE:]
 
         if frag_total == 0:
-            RNS.log(
-                f"MeshCore_Channel_Interface [{self.name}]: "
-                "invalid fragment count 0",
-                RNS.LOG_WARNING
-            )
+            RNS.log(f"{iname}: invalid fragment count 0", RNS.LOG_WARNING)
             return
 
         if frag_idx >= frag_total:
             RNS.log(
-                f"MeshCore_Channel_Interface [{self.name}]: "
-                f"invalid fragment index "
-                f"{frag_idx}/{frag_total}",
+                f"{iname}: invalid fragment index {frag_idx}/{frag_total}",
                 RNS.LOG_WARNING
             )
             return
@@ -878,8 +815,7 @@ class MeshCore_Channel_Interface(Interface):
         if magic != self.MAGIC:
             if self.debug_level == "debug":
                 RNS.log(
-                    f"MeshCore_Channel_Interface [{self.name}]: "
-                    f"pipeline drop: bad magic {magic!r}",
+                    f"{iname}: pipeline drop: bad magic {magic!r}",
                     RNS.LOG_DEBUG
                 )
             return
@@ -887,8 +823,7 @@ class MeshCore_Channel_Interface(Interface):
         if src_id == self._own_src_id:
             if self.debug_level == "debug":
                 RNS.log(
-                    f"MeshCore_Channel_Interface [{self.name}]: "
-                    f"pipeline drop: own echo src={src_id.hex()}",
+                    f"{iname}: pipeline drop: own echo src={src_id.hex()}",
                     RNS.LOG_DEBUG
                 )
             return
@@ -905,7 +840,7 @@ class MeshCore_Channel_Interface(Interface):
 
         if self.debug_level == "debug":
             RNS.log(
-                f"MeshCore_Channel_Interface [{self.name}]: "
+                f"{iname}: "
                 f"dedupe check "
                 f"src={src_hex} "
                 f"pkt={pkt_id} "
@@ -917,7 +852,7 @@ class MeshCore_Channel_Interface(Interface):
         if cache_hit:
             if self.debug_level == "debug":
                 RNS.log(
-                    f"MeshCore_Channel_Interface [{self.name}]: "
+                    f"{iname}: "
                     f"pipeline drop: already delivered "
                     f"(src={src_hex} pkt={pkt_id})",
                     RNS.LOG_DEBUG
@@ -925,83 +860,27 @@ class MeshCore_Channel_Interface(Interface):
             return
 
         RNS.log(
-            f"MeshCore_Channel_Interface [{self.name}]: "
+            f"{iname}: "
             f"RX frag src={src_hex}  pkt={pkt_id}  "
             f"{frag_idx+1}/{frag_total}  payload={len(payload)}B",
             RNS.LOG_DEBUG
         )
 
-        with self._asm_lock:
-            if key not in self._assembly:
-                self._assembly[key]      = {}
-                self._assembly_meta[key] = (frag_total, time.monotonic())
+        full_packet = reassemble_fragment(
+            self._assembly, self._assembly_meta, self._asm_lock,
+            key, frag_idx, frag_total, payload, interface_name=iname,
+        )
+        if full_packet is None:
+            return
 
-            if frag_idx in self._assembly[key]:
-                if self.debug_level == "debug":
-                    RNS.log(
-                        f"MeshCore_Channel_Interface [{self.name}]: "
-                        f"assembly state src={src_hex} "
-                        f"pkt={pkt_id} "
-                        f"stored={len(self._assembly[key])}/{frag_total}",
-                        RNS.LOG_DEBUG
-                    )
-                return
-
-            self._assembly[key][frag_idx] = payload
-
-            expected_total = self._assembly_meta[key][0]
-            if len(self._assembly[key]) < expected_total:
-                return
-
-            missing = [
-                i for i in range(expected_total)
-                if i not in self._assembly[key]
-            ]
-
-            if missing:
-                RNS.log(
-                    f"MeshCore_Channel_Interface [{self.name}]: "
-                    f"reassembly incomplete despite count match "
-                    f"missing={missing}",
-                    RNS.LOG_WARNING
-                )
-                return
-
-            try:
-                full_packet = b"".join(
-                    self._assembly[key][i] for i in range(expected_total)
-                )
-
-                del self._assembly[key]
-                del self._assembly_meta[key]
-
-            except KeyError as exc:
-                RNS.log(
-                    f"MeshCore_Channel_Interface [{self.name}]: "
-                    f"reassembly gap — missing fragment {exc}",
-                    RNS.LOG_WARNING
-                )
-                del self._assembly[key]
-                del self._assembly_meta[key]
-                return
-            except Exception as exc:
-                RNS.log(
-                    f"MeshCore_Channel_Interface [{self.name}]: "
-                    f"reassembly failed: {exc}",
-                    RNS.LOG_ERROR
-                )
-                del self._assembly[key]
-                del self._assembly_meta[key]
-                return
-
-            RNS.log(
-                f"MeshCore_Channel_Interface [{self.name}]: "
-                f"reassembly complete "
-                f"src={src_hex} "
-                f"pkt={pkt_id} "
-                f"len={len(full_packet)}",
-                RNS.LOG_DEBUG
-            )
+        RNS.log(
+            f"{iname}: "
+            f"reassembly complete "
+            f"src={src_hex} "
+            f"pkt={pkt_id} "
+            f"len={len(full_packet)}",
+            RNS.LOG_DEBUG
+        )
 
         with self._seen_lock:
             self._seen_pkts[key] = time.monotonic()
@@ -1011,31 +890,27 @@ class MeshCore_Channel_Interface(Interface):
                     self._seen_pkts.popitem(last=False)
 
         RNS.log(
-            f"MeshCore_Channel_Interface [{self.name}]: "
+            f"{iname}: "
             f"RX reassembled {len(full_packet)}B from src={src_hex}",
             RNS.LOG_INFO
         )
 
         try:
             if len(full_packet) == 0:
-                RNS.log(
-                    f"MeshCore_Channel_Interface [{self.name}]: "
-                    "empty reassembled packet",
-                    RNS.LOG_WARNING
-                )
+                RNS.log(f"{iname}: empty reassembled packet", RNS.LOG_WARNING)
                 return
 
             RNS.log(
-                f"MeshCore_Channel_Interface [{self.name}]: "
+                f"{iname}: "
                 f"reassembled len={len(full_packet)} "
-                f"from {expected_total} fragments",
+                f"from {frag_total} fragments",
                 RNS.LOG_DEBUG
             )
 
             self.processIncoming(full_packet)
 
             RNS.log(
-                f"MeshCore_Channel_Interface [{self.name}]: "
+                f"{iname}: "
                 f"delivered packet "
                 f"src={src_hex} "
                 f"pkt={pkt_id} "
@@ -1045,26 +920,18 @@ class MeshCore_Channel_Interface(Interface):
 
         except Exception as exc:
             RNS.log(
-                f"MeshCore_Channel_Interface [{self.name}]: "
-                f"processIncoming failed: {exc}",
+                f"{iname}: processIncoming failed: {exc}",
                 RNS.LOG_ERROR
             )
 
     async def _cleanup_loop(self):
+        iname = f"MeshCore_Channel_Interface [{self.name}]"
         while True:
             await asyncio.sleep(60)
-            deadline = time.monotonic() - self.fragment_timeout_s
-            with self._asm_lock:
-                stale = [k for k, (_, ts) in self._assembly_meta.items()
-                         if ts < deadline]
-                for k in stale:
-                    del self._assembly[k]
-                    del self._assembly_meta[k]
-                    RNS.log(
-                        f"MeshCore_Channel_Interface [{self.name}]: "
-                        f"evicted stale assembly {k}",
-                        RNS.LOG_WARNING
-                    )
+            cleanup_stale_fragments(
+                self._assembly, self._assembly_meta, self._asm_lock,
+                self.fragment_timeout_s, interface_name=iname,
+            )
 
     # =======================================================================
     # OUTGOING PATH
@@ -1077,9 +944,7 @@ class MeshCore_Channel_Interface(Interface):
         if not self.online:
             return
 
-        with self._pkt_id_lock:
-            pkt_id       = self._pkt_id
-            self._pkt_id = (self._pkt_id + 1) & 0xFF
+        pkt_id = self._pkt_counter.next_id()
 
         handler = _PacketHandler(data, self._own_src_id, pkt_id)
 
@@ -1253,13 +1118,7 @@ class MeshCore_Channel_Interface(Interface):
     # =======================================================================
 
     def processIncoming(self, data: bytes):
-        # RNS 1.x Interface base class has no processIncoming method.
-        # The correct pattern (matching TCPClientInterface and all other RNS
-        # interfaces) is: update rxb, then call owner.inbound() directly.
-        # super() also does not work in exec()'d files under Python 3.13.
-        if self.online and not self.detached:
-            self.rxb += len(data)
-            self.owner.inbound(data, self)
+        process_incoming(self, data)
 
     def __str__(self):
         return f"MeshCore_Channel_Interface[{self.name}]"
