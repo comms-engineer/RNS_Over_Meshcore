@@ -143,7 +143,8 @@ class MeshCoreInterface(Interface):
                                     cfg[k.strip()] = v.strip()
                             if cfg:
                                 return cfg
-            except Exception:
+            except Exception as exc:
+                _safe_log(self._LOG_WARNING, f"MeshCore: failed to read config file {p}: {exc}")
                 continue
         return None
 
@@ -285,8 +286,8 @@ class MeshCoreInterface(Interface):
                             # map advert name lower() -> contact public key for quick resolution
                             self.dest_to_node_dict[adv.lower()] = contact
                     _safe_log(self._LOG_INFO, f"MeshCore: discovered {len(contacts)} contacts on device")
-            except Exception:
-                pass
+            except Exception as exc:
+                _safe_log(self._LOG_WARNING, f"MeshCore: initial contact fetch failed: {exc}")
 
             # Map endpoint_contact explicitly if configured
             if self.endpoint_contact:
@@ -307,24 +308,20 @@ class MeshCoreInterface(Interface):
             _safe_log(self._LOG_INFO, "MeshCoreInterface: online (meshcore ready)")
 
             # Register with RNS transport only once and only after online
-            try:
-                # RNS.Transport.register_interface(self) - use Interface.register? Use Transport global if available
-                if not self._registered_with_rns:
-                    try:
-                        # Preferred: RNS.Transport.register_interface
-                        transport = getattr(RNS, "Transport", None)
-                        if transport and hasattr(transport, "register_interface"):
-                            transport.register_interface(self)
-                        else:
-                            # Fallback to Interface.register_interface if present
-                            if hasattr(self, "register_interface"):
-                                self.register_interface()
-                        self._registered_with_rns = True
-                        _safe_log(self._LOG_INFO, f"MeshCoreInterface: registered with Reticulum transport (name={self.name})")
-                    except Exception as e:
-                        _safe_log(self._LOG_WARNING, f"MeshCoreInterface: failed to register with Reticulum transport: {e}")
-            except Exception:
-                pass
+            if not self._registered_with_rns:
+                try:
+                    # Preferred: RNS.Transport.register_interface
+                    transport = getattr(RNS, "Transport", None)
+                    if transport and hasattr(transport, "register_interface"):
+                        transport.register_interface(self)
+                    else:
+                        # Fallback to Interface.register_interface if present
+                        if hasattr(self, "register_interface"):
+                            self.register_interface()
+                    self._registered_with_rns = True
+                    _safe_log(self._LOG_INFO, f"MeshCoreInterface: registered with Reticulum transport (name={self.name})")
+                except Exception as e:
+                    _safe_log(self._LOG_WARNING, f"MeshCoreInterface: failed to register with Reticulum transport: {e}")
 
             return True
             
@@ -332,9 +329,8 @@ class MeshCoreInterface(Interface):
 
         try:
             fut.result(timeout=5)
-        except Exception:
-            # That's fine; _async_setup will complete asynchronously
-            pass
+        except Exception as exc:
+            _safe_log(self._LOG_DEBUG, f"MeshCore: async setup did not complete within 5s (will continue in background): {exc}")
             
     async def _handle_incoming_payload(self, event, payload):
         """
@@ -393,7 +389,8 @@ class MeshCoreInterface(Interface):
                     sender_hex = contact_obj.get("public_key") or contact_obj.get("pubkey")
                 else:
                     sender_hex = str(from_key)
-        except Exception:
+        except Exception as exc:
+            _safe_log(self._LOG_DEBUG, f"MeshCore: sender key normalization fallback: {exc}")
             sender_hex = str(from_key)
 
         # Normalize short prefixes to hex-like strings for dictionary keys
@@ -412,8 +409,8 @@ class MeshCoreInterface(Interface):
             if sender_hex and isinstance(sender_hex, str) and len(sender_hex) >= 8:
                 # ensure a mapping exists for the sender prefix -> contact (use contact_obj if available)
                 self.dest_to_node_dict[sender_hex[:8]] = contact_obj or sender_hex
-        except Exception:
-            pass
+        except Exception as exc:
+            _safe_log(self._LOG_DEBUG, f"MeshCore: peer mapping update failed: {exc}")
 
         # Debug: print raw metadata bytes for inspection
         try:
@@ -513,10 +510,10 @@ class MeshCoreInterface(Interface):
                                 self.endpoint_contact = pk
                                 _safe_log(self._LOG_INFO, f"MeshCore: endpoint_contact resolved to {adv} ({pk[:12]}...)")
                                 break
-                except Exception:
-                    pass
-        except Exception:
-            pass
+                except Exception as exc:
+                    _safe_log(self._LOG_WARNING, f"MeshCore: endpoint_contact resolution failed: {exc}")
+        except Exception as exc:
+            _safe_log(self._LOG_WARNING, f"MeshCore: _handle_new_contact_event error: {exc}")
 
     def _payload_for_send(self, data: bytes) -> str:
         """
@@ -691,7 +688,8 @@ class MeshCoreInterface(Interface):
                     mapped = self.dest_to_node_dict.get(bytes(rns_dest).hex()) or self.dest_to_node_dict.get(bytes(rns_dest).hex()[:8])
                     if mapped:
                         dest = mapped
-            except Exception:
+            except Exception as exc:
+                _safe_log(self._LOG_DEBUG, f"MeshCore: destination extraction failed: {exc}")
                 dest = None
 
             # normalize dest to hex string if bytes

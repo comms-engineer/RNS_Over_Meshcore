@@ -548,8 +548,11 @@ class MeshCore_Dynamic_Interface(Interface):
                 await self._mc.commands.set_radio(
                     self.radio_freq, self.radio_bw, self.radio_sf, self.radio_cr
                 )
-            except Exception:
-                pass
+            except Exception as exc:
+                RNS.log(
+                    f"MeshCore_Dynamic_Interface [{self.name}]: "
+                    f"Radio config error: {exc}", RNS.LOG_WARNING
+                )
 
         try:
             secret_bytes = bytes.fromhex(self.channel_secret_hex)
@@ -652,8 +655,12 @@ class MeshCore_Dynamic_Interface(Interface):
                             f"{self.BIND_REQ_PREFIX}"
                             f"{self._own_mc_key}:{self._own_capability()}"
                         )
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        RNS.log(
+                            f"MeshCore_Dynamic_Interface [{self.name}]: "
+                            f"Failed to send RNSBIND_REQ: {exc}",
+                            RNS.LOG_WARNING
+                        )
                 retries += 1
                 await asyncio.sleep(self.BIND_RESP_WINDOW_S)
 
@@ -666,8 +673,12 @@ class MeshCore_Dynamic_Interface(Interface):
                             f"{self.BIND_PREFIX}"
                             f"{self._own_mc_key}:{self._own_capability()}"
                         )
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        RNS.log(
+                            f"MeshCore_Dynamic_Interface [{self.name}]: "
+                            f"Failed to send RNSBIND heartbeat: {exc}",
+                            RNS.LOG_WARNING
+                        )
                 await asyncio.sleep(self.BIND_HEARTBEAT_S)
 
     async def _delayed_bind_response(self):
@@ -686,8 +697,12 @@ class MeshCore_Dynamic_Interface(Interface):
                 f"after {delay:.1f}s backoff.",
                 RNS.LOG_DEBUG
             )
-        except Exception:
-            pass
+        except Exception as exc:
+            RNS.log(
+                f"MeshCore_Dynamic_Interface [{self.name}]: "
+                f"Failed to send RNSBIND response: {exc}",
+                RNS.LOG_WARNING
+            )
 
     # -------------------------------------------------------------------------
     # Maintenance
@@ -877,7 +892,13 @@ class MeshCore_Dynamic_Interface(Interface):
         b64 += "=" * (-len(b64) % 4)
         try:
             raw = base64.urlsafe_b64decode(b64)
-        except Exception:
+        except Exception as exc:
+            if self.debug_level == "debug":
+                RNS.log(
+                    f"MeshCore_Dynamic_Interface [{self.name}]: "
+                    f"base64 decode error: {exc}",
+                    RNS.LOG_DEBUG
+                )
             return
 
         if len(raw) < self.HEADER_SIZE:
@@ -922,7 +943,12 @@ class MeshCore_Dynamic_Interface(Interface):
                 )
                 del self._assembly[key]
                 del self._assembly_meta[key]
-            except Exception:
+            except Exception as exc:
+                RNS.log(
+                    f"MeshCore_Dynamic_Interface [{self.name}]: "
+                    f"Reassembly failed for pkt_id={pkt_id} "
+                    f"from '{sender}': {exc}", RNS.LOG_WARNING
+                )
                 self._assembly.pop(key, None)
                 self._assembly_meta.pop(key, None)
                 return
@@ -1126,8 +1152,12 @@ class MeshCore_Dynamic_Interface(Interface):
                 try:
                     # Thread-safe blocking put handles backpressure cleanly
                     self._outqueue.put((mode, target, frag_str), block=True, timeout=None)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    RNS.log(
+                        f"MeshCore_Dynamic_Interface [{self.name}]: "
+                        f"Failed to enqueue fragment: {exc}",
+                        RNS.LOG_WARNING
+                    )
 
         self.txb += len(data)
 
