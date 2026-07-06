@@ -196,7 +196,9 @@ INFRASTRUCTURE / TRANSPORT NODE  (fixed gateway with backbone connectivity)
   │     allow_direct = yes      # use unicast direct msgs when route known │
   │     peer_ttl = 86400        # seconds before a silent peer expires     │
   │                                                                         │
-  │     debug_level = info      # info | debug                             │
+  │     # Verbosity: this driver logs its own routing/rate-limiter/peer-     │
+  │     # binding events at RNS.LOG_INFO, so they show up at the standard   │
+  │     # [logging] loglevel = 4 without needing full RNS-core debug (7).   │
   │                                                                         │
   │   [[Backbone Interface]]                                                │
   │     type = BackboneInterface                                            │
@@ -377,6 +379,17 @@ class MeshCore_Dynamic_Interface(Interface):
         # burst window has elapsed, to stop genuine long-run spam.
         self._path_req_burst_window_s = float(cfg.get("path_req_burst_window", 60))
 
+        # An incoming path request (DATA+PLAIN) for a destination we host or
+        # know a path to causes RNS Transport to answer with a fresh outgoing
+        # ANNOUNCE for that destination, almost immediately. That announce is
+        # demand-driven and already naturally rate-limited by how often peers
+        # ask -- it is NOT the kind of spontaneous re-announce that
+        # outgoing_announce_rate exists to throttle. This window lets that
+        # one response bypass the announce rate limiter so a routine
+        # self-announce sent shortly before a path request doesn't cause the
+        # response to be silently dropped. See processOutgoing().
+        self._path_response_bypass_s = float(cfg.get("path_response_bypass_window", 15))
+
         # --- Routing capability --------------------------------------------
         self.can_route = (
             cfg.get("can_route", "yes").lower() not in ("no", "false", "0")
@@ -388,7 +401,6 @@ class MeshCore_Dynamic_Interface(Interface):
 
         self.peer_ttl_s = float(cfg.get("peer_ttl", 86400))
         self.bitrate = int(cfg.get("bitrate", 300))
-        self.debug_level = cfg.get("debug_level", "info").lower()
 
         # --- Internal async / threading state ------------------------------
         self._mc          = None
@@ -424,6 +436,12 @@ class MeshCore_Dynamic_Interface(Interface):
         self._announce_sent_lock  = threading.Lock()
         self._path_req_sent_times = {}   
         self._path_req_sent_lock  = threading.Lock()
+
+        # dest_id -> monotonic expiry. Set when we observe an inbound path
+        # request; consulted (and consumed) by the outgoing announce rate
+        # limiter to bypass it for the resulting path-response announce.
+        self._path_response_pending = {}
+        self._path_response_pending_lock = threading.Lock()
 
         self._has_direct_api    = False  
         self._pending_resp_task = None  
@@ -684,7 +702,7 @@ class MeshCore_Dynamic_Interface(Interface):
                 f"MeshCore_Dynamic_Interface [{self.name}]: "
                 f"Sent RNSBIND response [cap={self._own_capability()}] "
                 f"after {delay:.1f}s backoff.",
-                RNS.LOG_DEBUG
+                RNS.LOG_INFO
             )
         except Exception:
             pass
@@ -740,7 +758,7 @@ class MeshCore_Dynamic_Interface(Interface):
                     RNS.log(
                         f"MeshCore_Dynamic_Interface [{self.name}]: "
                         f"Expired {len(expired)} stale peer(s).",
-                        RNS.LOG_DEBUG
+                        RNS.LOG_INFO
                     )
 
             # --- Old announce rate entries ---------------------------------
@@ -764,6 +782,18 @@ class MeshCore_Dynamic_Interface(Interface):
                     ]
                     for k in stale_pr:
                         del self._path_req_sent_times[k]
+
+            # --- Expired path-response bypass entries -----------------------
+            # Cleans up cases where the expected outgoing announce never
+            # happened (e.g. we don't actually own/have a path to the
+            # requested destination), so entries don't accumulate forever.
+            with self._path_response_pending_lock:
+                stale_prp = [
+                    k for k, expiry in self._path_response_pending.items()
+                    if now >= expiry
+                ]
+                for k in stale_prp:
+                    del self._path_response_pending[k]
 
     # -------------------------------------------------------------------------
     # Inbound event handlers
@@ -947,25 +977,23 @@ class MeshCore_Dynamic_Interface(Interface):
                             ]
                             for t in trim:
                                 del self._rns_to_mc_map[t]
-                        if self.debug_level == "debug":
-                            RNS.log(
-                                f"MeshCore_Dynamic_Interface [{self.name}]: "
-                                f"Linked RNS token {rns_token.hex()[:8]} "
-                                f"-> '{sender}'",
-                                RNS.LOG_DEBUG
-                            )
+                        RNS.log(
+                            f"MeshCore_Dynamic_Interface [{self.name}]: "
+                            f"Linked RNS token {rns_token.hex()[:8]} "
+                            f"-> '{sender}'",
+                            RNS.LOG_INFO
+                        )
 
                     if full_packet[0] & 0x03 == self._RNS_PTYPE_LINK_REQ:
                         link_id = self._link_id_from_lr_packet(full_packet)
                         if link_id is not None and link_id not in self._rns_to_mc_map:
                             self._rns_to_mc_map[link_id] = mc_key
-                            if self.debug_level == "debug":
-                                RNS.log(
-                                    f"MeshCore_Dynamic_Interface [{self.name}]: "
-                                    f"Pre-bound link_id {link_id.hex()[:8]} "
-                                    f"-> '{sender}' from LINK_REQUEST",
-                                    RNS.LOG_DEBUG
-                                )
+                            RNS.log(
+                                f"MeshCore_Dynamic_Interface [{self.name}]: "
+                                f"Pre-bound link_id {link_id.hex()[:8]} "
+                                f"-> '{sender}' from LINK_REQUEST",
+                                RNS.LOG_INFO
+                            )
         if full_packet:
             ptype = full_packet[0] & 0x03
             ptype_str = {
@@ -980,6 +1008,24 @@ class MeshCore_Dynamic_Interface(Interface):
                 f"RX -> {rx_mode} from '{sender}'. Reassembled {len(full_packet)}b {ptype_str} packet.",
                 RNS.LOG_INFO
             )
+
+            # An incoming DATA+PLAIN packet is a path request. If Transport
+            # owns this destination (or has a cached path to it), it will
+            # turn around and call processOutgoing() with a fresh ANNOUNCE
+            # for it almost immediately. Flag the destination so that
+            # announce isn't mistaken for a spontaneous re-announce and
+            # suppressed by the outgoing announce rate limiter below.
+            dest_type = (full_packet[0] >> 2) & 0x03
+            if (
+                ptype == self._RNS_PTYPE_DATA
+                and dest_type == self._RNS_DTYPE_PLAIN
+                and len(full_packet) >= 12
+            ):
+                dest_id = bytes(full_packet[2:12])
+                with self._path_response_pending_lock:
+                    self._path_response_pending[dest_id] = (
+                        time.monotonic() + self._path_response_bypass_s
+                    )
         try:
             self.processIncoming(full_packet)
         except Exception as exc:
@@ -1045,14 +1091,43 @@ class MeshCore_Dynamic_Interface(Interface):
         ptype     = hdr_byte & 0x03         
         dest_type = (hdr_byte >> 2) & 0x03  
 
-        # Per-destination outgoing announce rate limiter
+        # Per-destination outgoing announce rate limiter. Bypassed for
+        # announces that are answering a path request we recently saw come
+        # in for this same destination (see _path_response_pending) -- those
+        # are demand-driven responses, not spontaneous re-announces, and
+        # dropping them silently is what causes intermittent "path request
+        # timed out" failures on the requesting side when a routine
+        # self-announce happened to go out shortly beforehand.
         if self._announce_rate_s > 0 and len(data) >= 12:
             if ptype == self._RNS_PTYPE_ANNOUNCE:
                 dest_id = bytes(data[2:12])
                 now     = time.monotonic()
+
+                with self._path_response_pending_lock:
+                    expiry = self._path_response_pending.pop(dest_id, None)
+                answering_path_request = expiry is not None and now < expiry
+
+                if not answering_path_request:
+                    with self._announce_sent_lock:
+                        last = self._announce_sent_times.get(dest_id, 0)
+                        if now - last < self._announce_rate_s:
+                            RNS.log(
+                                f"MeshCore_Dynamic_Interface [{self.name}]: "
+                                f"Suppressing outgoing announce for "
+                                f"{dest_id.hex()[:8]} -- {now - last:.0f}s "
+                                f"since last (< {self._announce_rate_s:.0f}s limit).",
+                                RNS.LOG_INFO
+                            )
+                            return
+                else:
+                    RNS.log(
+                        f"MeshCore_Dynamic_Interface [{self.name}]: "
+                        f"Announce for {dest_id.hex()[:8]} bypassing rate "
+                        f"limiter -- answering a recent path request.",
+                        RNS.LOG_INFO
+                    )
+
                 with self._announce_sent_lock:
-                    if now - self._announce_sent_times.get(dest_id, 0) < self._announce_rate_s:
-                        return
                     self._announce_sent_times[dest_id] = now
 
         # Per-destination outgoing path request rate limiter, with a burst
