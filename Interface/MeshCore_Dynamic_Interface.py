@@ -308,6 +308,17 @@ class MeshCore_Dynamic_Interface(Interface):
     # Time window (seconds) to block processing duplicate packets that were fully reassembled.
     DEDUPLICATION_TTL_S = 30.0
 
+    # Min gap between opportunistic RNSBIND_REQs fired for the same
+    # still-unbound sender. Keeps a chatty unbound neighbor from causing a
+    # REQ on every single fragment it emits.
+    UNBOUND_REQ_RETRY_S = 120.0
+
+    # Bounds on how much state we'll hold for senders we've observed traffic
+    # from but haven't bound yet, so a burst of announces from strangers
+    # can't grow these dicts without limit.
+    _PENDING_TOKENS_MAX_SENDERS    = 64
+    _PENDING_TOKENS_MAX_PER_SENDER = 16
+
     # -------------------------------------------------------------------------
     # Constructor
     # -------------------------------------------------------------------------
@@ -390,6 +401,30 @@ class MeshCore_Dynamic_Interface(Interface):
         # response to be silently dropped. See processOutgoing().
         self._path_response_bypass_s = float(cfg.get("path_response_bypass_window", 15))
 
+        # --- Retransmission for broadcast-only (CHANNEL-forced) packets ----
+        # ANNOUNCE and path-request (DATA+PLAIN) packets can never use the
+        # ACK'd DIRECT path -- they're always raw, unacknowledged CHANNEL
+        # fragments (see _is_broadcast_packet / processOutgoing). Losing a
+        # single fragment silently kills the whole reassembly with no retry.
+        # These settings resend the SAME pkt_id and fragment set after a
+        # jittered delay: the receiver's reassembly buffer accepts whichever
+        # fragments arrive from either attempt (see _process_tunnel_text),
+        # so a partial success on pass 1 plus a partial success on pass 2 can
+        # still add up to a complete packet, rather than requiring one pass
+        # to land end-to-end.
+        #
+        # Default is higher for announces than path requests: an announce is
+        # usually a one-shot, application-scheduled event with no protocol-
+        # level retry of its own. A path request already gets ~4 natural
+        # retry attempts from RNS Transport itself roughly 4-10s apart (see
+        # path_req_burst_window above), so extra retransmission here is
+        # additive on top of that and defaults to off -- enable it only if
+        # you're seeing path resolution fail even within that natural burst.
+        self.announce_retransmit_extra = int(cfg.get("announce_retransmit_extra", 2))
+        self.path_req_retransmit_extra = int(cfg.get("path_req_retransmit_extra", 0))
+        self.retransmit_jitter_min_s   = float(cfg.get("retransmit_jitter_min", 8.0))
+        self.retransmit_jitter_max_s   = float(cfg.get("retransmit_jitter_max", 20.0))
+
         # --- Routing capability --------------------------------------------
         self.can_route = (
             cfg.get("can_route", "yes").lower() not in ("no", "false", "0")
@@ -431,6 +466,18 @@ class MeshCore_Dynamic_Interface(Interface):
         self._peer_caps      = {}
         self._rns_to_mc_map  = {}
         self._peer_lock      = threading.Lock()
+
+        # sender_name -> set of RNS tokens observed from them before their
+        # MeshCore pubkey was known (RNSBIND not yet complete). Backfilled
+        # into _rns_to_mc_map the moment _handle_bind learns that sender's
+        # key -- see _process_tunnel_text() and _handle_bind().
+        self._pending_tokens      = {}
+        self._pending_tokens_lock = threading.Lock()
+
+        # sender_name -> monotonic timestamp of the last opportunistic
+        # RNSBIND_REQ fired on their behalf, so we don't spam the channel.
+        self._last_unbound_req      = {}
+        self._last_unbound_req_lock = threading.Lock()
 
         self._announce_sent_times = {}   
         self._announce_sent_lock  = threading.Lock()
@@ -707,6 +754,42 @@ class MeshCore_Dynamic_Interface(Interface):
         except Exception:
             pass
 
+    async def _opportunistic_bind_req(self, sender: str):
+        """
+        Fired when we reassemble an RNS packet from a sender we haven't
+        bound with yet. _bind_discovery_loop's active REQ phase only runs
+        while we have zero peers total, so it never re-triggers to chase
+        down one specific new/unbound neighbor once we already have at
+        least one bound peer (e.g. a stable gateway). This closes that gap
+        by requesting a bind as soon as we notice we need one, independent
+        of how many other peers we already know -- rate-limited per sender
+        so a burst of fragments from the same stranger doesn't flood the
+        channel with REQs.
+        """
+        now = time.monotonic()
+        with self._last_unbound_req_lock:
+            last = self._last_unbound_req.get(sender, 0)
+            if now - last < self.UNBOUND_REQ_RETRY_S:
+                return
+            self._last_unbound_req[sender] = now
+
+        if not self.online or not self._own_mc_key:
+            return
+        try:
+            await self._mc.commands.send_chan_msg(
+                self.channel_idx,
+                f"{self.BIND_REQ_PREFIX}"
+                f"{self._own_mc_key}:{self._own_capability()}"
+            )
+            RNS.log(
+                f"MeshCore_Dynamic_Interface [{self.name}]: "
+                f"Saw RNS traffic from unbound peer '{sender}' -- "
+                f"sent opportunistic RNSBIND_REQ.",
+                RNS.LOG_INFO
+            )
+        except Exception:
+            pass
+
     # -------------------------------------------------------------------------
     # Maintenance
     # -------------------------------------------------------------------------
@@ -782,6 +865,22 @@ class MeshCore_Dynamic_Interface(Interface):
                     ]
                     for k in stale_pr:
                         del self._path_req_sent_times[k]
+
+            # --- Stale pending-token / opportunistic-req bookkeeping --------
+            # For senders that stashed tokens but never completed RNSBIND
+            # (e.g. they went out of range for good). Uses the same
+            # peer_ttl_s window as bound peers.
+            with self._last_unbound_req_lock:
+                stale_unbound = [
+                    name for name, ts in self._last_unbound_req.items()
+                    if ts < peer_deadline
+                ]
+                for name in stale_unbound:
+                    del self._last_unbound_req[name]
+            if stale_unbound:
+                with self._pending_tokens_lock:
+                    for name in stale_unbound:
+                        self._pending_tokens.pop(name, None)
 
             # --- Expired path-response bypass entries -----------------------
             # Cleans up cases where the expected outgoing announce never
@@ -871,6 +970,25 @@ class MeshCore_Dynamic_Interface(Interface):
 
             self._peer_caps[sender_name]      = peer_can_route
             self._peer_last_seen[sender_name] = time.monotonic()
+
+        # Backfill: this sender may have sent us RNS packets before we knew
+        # their key. Those tokens were stashed instead of dropped -- drain
+        # them into _rns_to_mc_map now instead of waiting to observe fresh
+        # traffic from them (which, on a quiet LoRa-only link, might not
+        # arrive again for a long time).
+        with self._pending_tokens_lock:
+            pending = self._pending_tokens.pop(sender_name, None)
+        if pending:
+            with self._peer_lock:
+                for tok in pending:
+                    if tok not in self._rns_to_mc_map:
+                        self._rns_to_mc_map[tok] = mc_pubkey
+            RNS.log(
+                f"MeshCore_Dynamic_Interface [{self.name}]: "
+                f"Backfilled {len(pending)} pending RNS token(s) for "
+                f"newly-bound peer '{sender_name}'.",
+                RNS.LOG_INFO
+            )
 
         if existing != mc_pubkey or cap_changed:
             RNS.log(
@@ -994,6 +1112,28 @@ class MeshCore_Dynamic_Interface(Interface):
                                 f"-> '{sender}' from LINK_REQUEST",
                                 RNS.LOG_INFO
                             )
+
+            if not mc_key:
+                # sender hasn't completed RNSBIND with us yet. Previously
+                # this token was just dropped here -- if RNSBIND never
+                # happened to complete afterwards (or completed too late),
+                # this destination stayed CHANNEL-only forever even after
+                # the peer became known, because nothing re-checked it.
+                # Stash it so _handle_bind() can backfill it the moment the
+                # bind completes, and nudge that along instead of waiting
+                # on the passive heartbeat/zero-peer REQ cycle.
+                with self._pending_tokens_lock:
+                    bucket = self._pending_tokens.get(sender)
+                    if bucket is None:
+                        if len(self._pending_tokens) < self._PENDING_TOKENS_MAX_SENDERS:
+                            bucket = set()
+                            self._pending_tokens[sender] = bucket
+                    if (
+                        bucket is not None
+                        and len(bucket) < self._PENDING_TOKENS_MAX_PER_SENDER
+                    ):
+                        bucket.add(rns_token)
+                asyncio.create_task(self._opportunistic_bind_req(sender))
         if full_packet:
             ptype = full_packet[0] & 0x03
             ptype_str = {
@@ -1204,7 +1344,45 @@ class MeshCore_Dynamic_Interface(Interface):
                 except Exception:
                     pass
 
+        # Schedule extra passes for broadcast-only packet types. Path
+        # RESPONSES aren't a distinct packet type in this system -- they're
+        # just an ANNOUNCE that happened to be triggered by an inbound path
+        # request (see _path_response_pending above) -- so they're already
+        # covered by the announce_retransmit_extra branch below with no
+        # separate handling needed.
+        retransmit_extra = 0
+        if broadcast:
+            if ptype == self._RNS_PTYPE_ANNOUNCE:
+                retransmit_extra = self.announce_retransmit_extra
+            elif ptype == self._RNS_PTYPE_DATA and dest_type == self._RNS_DTYPE_PLAIN:
+                retransmit_extra = self.path_req_retransmit_extra
+
+        if retransmit_extra > 0:
+            asyncio.run_coroutine_threadsafe(
+                self._delayed_retransmits(handler.fragments, route, retransmit_extra),
+                self._loop
+            )
+
         self.txb += len(data)
+
+    async def _delayed_retransmits(self, fragments, route, count):
+        for i in range(count):
+            delay = random.uniform(self.retransmit_jitter_min_s, self.retransmit_jitter_max_s)
+            await asyncio.sleep(delay)
+            if not self.online:
+                return
+            for frag_str in fragments:
+                for mode, target in route:
+                    try:
+                        self._outqueue.put_nowait((mode, target, frag_str))
+                    except queue.Full:
+                        pass
+            RNS.log(
+                f"MeshCore_Dynamic_Interface [{self.name}]: "
+                f"Retransmit pass {i + 1}/{count} sent "
+                f"({len(fragments)} fragment(s), same pkt_id).",
+                RNS.LOG_INFO
+            )
 
     async def _async_outgoing_worker(self):
         """
