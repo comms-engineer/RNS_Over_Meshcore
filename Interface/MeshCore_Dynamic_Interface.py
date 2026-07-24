@@ -343,8 +343,44 @@ class MeshCore_Dynamic_Interface(Interface):
         # --- Channel identity ----------------------------------------------
         self.channel_idx        = int(str(cfg.get("channel_idx", 0)).strip())
         self.channel_name       = cfg.get("channel_name", "RNSTunnel")
-        self.channel_secret_hex = cfg.get("channel_secret",
-                                          "00000000000000000000000000000000")
+        self.channel_secret_hex = cfg.get("channel_secret", "")
+
+        # Validate channel_secret: refuse to start with a missing or insecure
+        # default.  A known/all-zeros key means traffic is effectively
+        # unencrypted — any eavesdropper can decode and inject packets.
+        _INSECURE_DEFAULTS = (
+            "",
+            "00000000000000000000000000000000",
+        )
+        if self.channel_secret_hex.lower().strip() in _INSECURE_DEFAULTS:
+            RNS.log(
+                f"MeshCore_Dynamic_Interface [{self.name}]: CRITICAL — "
+                f"'channel_secret' is missing or set to an insecure default. "
+                f"All nodes sharing this interface MUST use a unique secret. "
+                f"Generate one with: openssl rand -hex 16",
+                RNS.LOG_CRITICAL
+            )
+            raise ValueError(
+                f"MeshCore_Dynamic_Interface [{self.name}]: "
+                "channel_secret is missing or insecure — refusing to start. "
+                "Set a unique 32-character hex secret (openssl rand -hex 16)."
+            )
+
+        # Validate format: must be valid hex and exactly 16 bytes (32 hex chars)
+        try:
+            _secret_bytes = bytes.fromhex(self.channel_secret_hex)
+        except ValueError:
+            raise ValueError(
+                f"MeshCore_Dynamic_Interface [{self.name}]: "
+                f"channel_secret is not valid hexadecimal: "
+                f"'{self.channel_secret_hex[:8]}...'"
+            )
+        if len(_secret_bytes) != 16:
+            raise ValueError(
+                f"MeshCore_Dynamic_Interface [{self.name}]: "
+                f"channel_secret must be exactly 16 bytes (32 hex chars), "
+                f"got {len(_secret_bytes)} bytes."
+            )
 
         # --- Optional radio parameter overrides ----------------------------
         self.radio_freq = float(cfg.get("freq", 0))

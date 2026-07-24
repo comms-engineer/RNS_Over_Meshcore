@@ -74,7 +74,7 @@ CONFIG STANZA — direct radio (serial example)
     baudrate = 115200
     channel_idx    = 39
     channel_name   = RNSTunnel
-    channel_secret = c4d2b6c8254e3b11200f57e95dcb1197
+    channel_secret = <your-32-hex-char-secret>   # openssl rand -hex 16
     fragment_delay  = 1.5
     fragment_timeout = 3600
     debug_level = debug
@@ -88,7 +88,7 @@ CONFIG STANZA — RemoteTerm mode (HTTP)
     transport        = remoteterm
     remoteterm_url   = http://localhost:8000
     channel_name     = RNSTunnel
-    channel_secret   = c4d2b6c8254e3b11200f57e95dcb1197
+    channel_secret   = <your-32-hex-char-secret>   # openssl rand -hex 16
     fragment_delay   = 1.5
     fragment_timeout = 3600
     debug_level = debug
@@ -103,7 +103,7 @@ CONFIG STANZA — RemoteTerm mode (HTTPS / self-signed cert)
     remoteterm_url        = https://host.docker.internal:8000
     remoteterm_ssl_verify = false   # set false for self-signed certs
     channel_name          = RNSTunnel
-    channel_secret        = c4d2b6c8254e3b11200f57e95dcb1197
+    channel_secret        = <your-32-hex-char-secret>   # openssl rand -hex 16
     fragment_delay        = 1.5
     fragment_timeout      = 3600
     debug_level = debug
@@ -243,7 +243,9 @@ class MeshCore_Channel_Interface(Interface):
             self._rt_ssl_ctx = _ctx
             RNS.log(
                 f"MeshCore_Channel_Interface [{self.name}]: "
-                "SSL certificate verification DISABLED (self-signed cert mode)",
+                "WARNING — SSL certificate verification DISABLED. "
+                "This exposes the connection to man-in-the-middle attacks. "
+                "Only use this for trusted networks with self-signed certs.",
                 RNS.LOG_WARNING
             )
         else:
@@ -251,8 +253,46 @@ class MeshCore_Channel_Interface(Interface):
 
         # ---- channel (both modes) ----
         self.channel_name       = cfg.get("channel_name",   "RNSTunnel")
-        self.channel_secret_hex = cfg.get("channel_secret",
-                                          "c4d2b6c8254e3b11200f57e95dcb1197")
+        self.channel_secret_hex = cfg.get("channel_secret", "")
+
+        # Validate channel_secret: refuse to start with a missing or insecure
+        # default.  A known/hardcoded key means traffic is effectively
+        # unencrypted — any eavesdropper who reads this source can decode and
+        # inject packets.
+        _INSECURE_DEFAULTS = (
+            "",
+            "00000000000000000000000000000000",
+            "c4d2b6c8254e3b11200f57e95dcb1197",  # old hardcoded default
+        )
+        if self.channel_secret_hex.lower().strip() in _INSECURE_DEFAULTS:
+            RNS.log(
+                f"MeshCore_Channel_Interface [{self.name}]: CRITICAL — "
+                f"'channel_secret' is missing or set to an insecure default. "
+                f"All nodes sharing this interface MUST use a unique secret. "
+                f"Generate one with: openssl rand -hex 16",
+                RNS.LOG_CRITICAL
+            )
+            raise ValueError(
+                f"MeshCore_Channel_Interface [{self.name}]: "
+                "channel_secret is missing or insecure — refusing to start. "
+                "Set a unique 32-character hex secret (openssl rand -hex 16)."
+            )
+
+        # Validate format: must be valid hex and exactly 16 bytes (32 hex chars)
+        try:
+            _secret_bytes = bytes.fromhex(self.channel_secret_hex)
+        except ValueError:
+            raise ValueError(
+                f"MeshCore_Channel_Interface [{self.name}]: "
+                f"channel_secret is not valid hexadecimal: "
+                f"'{self.channel_secret_hex[:8]}...'"
+            )
+        if len(_secret_bytes) != 16:
+            raise ValueError(
+                f"MeshCore_Channel_Interface [{self.name}]: "
+                f"channel_secret must be exactly 16 bytes (32 hex chars), "
+                f"got {len(_secret_bytes)} bytes."
+            )
 
         # conversation_key as RemoteTerm reports it — populated in
         # _rt_ensure_channel() once we learn the actual key format RemoteTerm uses.
