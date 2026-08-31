@@ -437,6 +437,15 @@ class MeshCore_Dynamic_Interface(Interface):
         self.peer_ttl_s = float(cfg.get("peer_ttl", 86400))
         self.bitrate = int(cfg.get("bitrate", 300))
 
+        # --- RNS core interface-contract attributes -------------------------
+        # RNS core checks `interface.HW_MTU + (interface.ifac_size or 0)` against
+        # every inbound packet before it's handed anywhere else — every custom
+        # interface must set both or Transport.preprocess_inbound() throws. This
+        # is the max size of a single *fully reassembled* RNS packet this
+        # interface can carry, not the per-fragment LoRa payload size
+        # (self.payload_size handles that).
+        self.HW_MTU    = RNS.Reticulum.MTU
+        
         # --- Internal async / threading state ------------------------------
         self._mc          = None
         self._EventType   = None
